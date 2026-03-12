@@ -31,7 +31,7 @@ The tool uses a traffic light system to indicate record quality:
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/flamingdeath80/dnstoolbox.git
+git clone https://github.com/alan-berger/dnstoolbox.git
 cd dnstoolbox
 ```
 
