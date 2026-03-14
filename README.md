@@ -1,17 +1,17 @@
 # DNS Email Security Checker
 
-A Python command-line tool that performs comprehensive checks on email-related DNS records and visualizes their security posture using color-coded output.
+A Python command-line tool that performs comprehensive checks on email-related DNS records and visualises their security posture using color-coded output.
 
 ## Features
 
 This tool checks and validates the following email security records:
 
 - **MX Records** - Mail exchange records for email delivery
-- **SPF (Sender Policy Framework)** - Validates authorized email senders and counts DNS lookups
+- **SPF (Sender Policy Framework)** - Validates authorised email senders and counts DNS lookups
 - **DKIM (DomainKeys Identified Mail)** - Checks for email signing keys
 - **DMARC (Domain-based Message Authentication)** - Email authentication policy with alignment checks
 - **MTA-STS (SMTP Mail Transfer Agent Strict Transport Security)** - Enforces secure SMTP connections
-- **BIMI (Brand Indicators for Message Identification)** - Verified brand logo display
+- **BIMI (Brand Indicators for Message Identification)** - Verifies brand logo presence
 
 ## Color-Coded Output
 
