@@ -10,7 +10,7 @@ The tool can output directly to the terminal or produce a self-contained HTML re
 
 | Check | What is validated |
 |---|---|
-| **MX** | Mail exchange records are present and the domain can receive email |
+| **MX** | Mail exchange records are present and in theory the domain can receive email |
 | **SPF** | Record is present, well-formed, and within the 10 DNS lookup limit (RFC 7208) |
 | **DKIM** | Signing keys are present for the tested selectors |
 | **DMARC** | Policy is present, enforcement level, and SPF/DKIM alignment strictness |
