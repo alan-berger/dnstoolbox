@@ -1215,13 +1215,16 @@ def main():
 
     domain = args.domain or input("Enter domain to check: ").strip()
 
+    dkim_selectors = check_dkim.__defaults__[0]
+    dkim_label = f"DKIM Record (selectors: {', '.join(dkim_selectors)})"
+
     checks = [
-        ("MX Records",                                             check_mx),
-        ("SPF Record",                                             check_spf),
-        ("DKIM Record (selectors: default, selector1, selector2)", check_dkim),
-        ("DMARC Record",                                           check_dmarc),
-        ("MTA-STS Record",                                         check_mta_sts),
-        ("BIMI Record",                                            check_bimi),
+        ("MX Records",   check_mx),
+        ("SPF Record",   check_spf),
+        (dkim_label,     check_dkim),
+        ("DMARC Record", check_dmarc),
+        ("MTA-STS Record", check_mta_sts),
+        ("BIMI Record",  check_bimi),
     ]
 
     gathered = []
