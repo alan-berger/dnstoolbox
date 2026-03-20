@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import html as html_lib
+import json
 import re
+import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from pathlib import Path
 
 import dns.resolver
 import requests
@@ -17,9 +20,10 @@ RED    = "\033[91m"
 CYAN   = "\033[96m"   # used exclusively for suggestion lines
 RESET  = "\033[0m"
 
-_STATUS_ANSI   = {'ok': GREEN, 'warn': YELLOW, 'missing': RED}
-_STATUS_SYMBOL = {'ok': '✓', 'warn': '⚠', 'missing': '✗'}
-_STATUS_LABEL  = {'ok': 'PASS', 'warn': 'WARNING', 'missing': 'FAIL'}
+_STATUS_ANSI    = {'ok': GREEN, 'warn': YELLOW, 'missing': RED}
+_STATUS_SYMBOL  = {'ok': '✓',   'warn': '⚠',   'missing': '✗'}
+_STATUS_LABEL   = {'ok': 'PASS', 'warn': 'WARNING', 'missing': 'FAIL'}
+_STATUS_COLOUR  = {'ok': 'green', 'warn': 'amber', 'missing': 'red'}
 
 # ---------------------------------------------------------------------------
 # HTML colour palette
@@ -29,6 +33,17 @@ _HTML_BORDER     = {'ok': '#16a34a', 'warn': '#d97706', 'missing': '#dc2626'}
 _HTML_BG         = {'ok': '#f0fdf4', 'warn': '#fffbeb', 'missing': '#fef2f2'}
 _HTML_BADGE_BG   = {'ok': '#dcfce7', 'warn': '#fef3c7', 'missing': '#fee2e2'}
 _HTML_BADGE_TEXT = {'ok': '#15803d', 'warn': '#b45309', 'missing': '#b91c1c'}
+
+# ---------------------------------------------------------------------------
+# Delivery-critical checks — the only ones tracked for state changes and
+# notifications. BIMI is intentionally excluded as it does not affect
+# email deliverability.
+# ---------------------------------------------------------------------------
+DELIVERY_CRITICAL_KEYS = {'mx', 'spf', 'dkim', 'dmarc', 'mta_sts'}
+
+# ntfy priority integers (1=min … 5=max) and emoji tags per status
+_NTFY_PRIORITY = {'warn': '3', 'missing': '4', 'ok': '2'}
+_NTFY_TAGS     = {'warn': 'warning', 'missing': 'rotating_light', 'ok': 'white_check_mark'}
 
 # ---------------------------------------------------------------------------
 # Shared HTTP helpers
@@ -42,9 +57,18 @@ _HTTP_HEADERS = {
 }
 
 
+# Module-level resolver with caching explicitly disabled.
+# dnspython's default resolver maintains an in-process cache that respects
+# TTL but could serve stale results if the same record is queried more than
+# once within a single run. Disabling it guarantees every query goes to the
+# wire, which is important when testing DNS changes with short TTLs.
+_resolver = dns.resolver.Resolver()
+_resolver.cache = None
+
+
 def get_dns_records(domain, record_type):
     try:
-        answers = dns.resolver.resolve(domain, record_type)
+        answers = _resolver.resolve(domain, record_type)
         return [rdata.to_text().strip('"') for rdata in answers]
     except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout):
         return []
@@ -163,14 +187,15 @@ def check_dkim(domain, selectors=('default', 'selector1', 'selector2')):
             all_records.append(f"{selector}: {rec}")
 
     if not all_records:
+        selector_list = ", ".join(selectors)
         return (
-            ["No DKIM record found for selectors: " + ", ".join(selectors)],
+            [f"No DKIM record found for selectors: {selector_list}"],
             "missing",
-            "No DKIM record found for the tested selectors (default, selector1, "
-            "selector2). Without DKIM, email cannot be cryptographically verified "
-            "and DMARC alignment on DKIM will always fail.",
+            f"No DKIM record found for the tested selectors ({selector_list}). "
+            "Without DKIM, email cannot be cryptographically verified and DMARC "
+            "alignment on DKIM will always fail.",
             [
-                "This script only tests three common selectors. Your mail provider "
+                "This script only tests the selectors listed above. Your mail provider "
                 "almost certainly uses a different one — a missing result here does "
                 "not necessarily mean DKIM is absent.",
                 "To find your actual selector: inspect the DKIM-Signature: header in "
@@ -264,23 +289,22 @@ def check_dmarc(domain):
         missing_flags = " and ".join(
             t for t, v in [("aspf=s", aspf), ("adkim=s", adkim)] if v != "s"
         )
-        suggestions = [
-            f"Add {missing_flags} to your DMARC record to require exact domain "
-            "matching rather than organisational-domain matching.",
-            "aspf=s requires the envelope sender (Return-Path) domain to exactly "
-            "match the From: header domain — not just share the same registered domain.",
-            "adkim=s requires the DKIM d= tag to exactly match the From: header "
-            "domain. Ensure your signing configuration uses the correct domain.",
-            "Before enabling strict alignment, confirm that all legitimate mail "
-            "passes strict checks — use DMARC reports to verify there are no failures.",
-        ]
         return (
             records,
             "warn",
             f"DMARC is enforced (p={policy}) but alignment is relaxed. "
             f"Adding {missing_flags} would prevent subdomain spoofing and "
             "provide the strongest protection.",
-            suggestions,
+            [
+                f"Add {missing_flags} to your DMARC record to require exact domain "
+                "matching rather than organisational-domain matching.",
+                "aspf=s requires the envelope sender (Return-Path) domain to exactly "
+                "match the From: header domain — not just share the same registered domain.",
+                "adkim=s requires the DKIM d= tag to exactly match the From: header "
+                "domain. Ensure your signing configuration uses the correct domain.",
+                "Before enabling strict alignment, confirm that all legitimate mail "
+                "passes strict checks — use DMARC reports to verify there are no failures.",
+            ],
         )
 
     return (
@@ -392,9 +416,9 @@ def check_mta_sts(domain):
             _MTA_STS_FILE_HINTS,
         )
 
-    policy    = _parse_mta_sts_policy(body)
-    hard_errs = []
-    warnings  = []
+    policy      = _parse_mta_sts_policy(body)
+    hard_errs   = []
+    warnings    = []
     suggestions = []
 
     # version
@@ -403,9 +427,7 @@ def check_mta_sts(domain):
             f"Invalid version field: '{policy.get('version', 'missing')}' "
             "(must be STSv1 per RFC 8461)"
         )
-        suggestions.append(
-            "Set the first line of your policy file to: version: STSv1"
-        )
+        suggestions.append("Set the first line of your policy file to: version: STSv1")
 
     # mode
     mode = policy.get('mode', '').lower()
@@ -420,9 +442,9 @@ def check_mta_sts(domain):
             "but connections are not rejected"
         )
         suggestions.append(
-            "Once you have verified that all inbound mail flows use valid TLS "
-            "(check SMTP TLS reports via rua= if configured), change mode: testing "
-            "to mode: enforce and update the id= value in your DNS TXT record."
+            "Once you have verified that all inbound mail flows use valid TLS, "
+            "change mode: testing to mode: enforce and update the id= value in "
+            "your DNS TXT record."
         )
     elif mode == 'none':
         hard_errs.append(
@@ -447,8 +469,7 @@ def check_mta_sts(domain):
         max_age = int(policy.get('max_age', 0))
         if max_age <= 0:
             hard_errs.append(
-                "max_age is missing or zero — a valid positive integer is required "
-                "(RFC 8461)"
+                "max_age is missing or zero — a valid positive integer is required (RFC 8461)"
             )
             suggestions.append(
                 "Add a max_age field to your policy file, e.g.: max_age: 86400 "
@@ -463,7 +484,7 @@ def check_mta_sts(domain):
             suggestions.append(
                 f"Increase max_age from {max_age} to at least 86400 (1 day). "
                 "A longer value such as 604800 (7 days) or 2592000 (30 days) "
-                "provides stronger protection by ensuring MTAs cache the policy longer."
+                "provides stronger protection."
             )
         elif max_age > RFC_MAX_AGE:
             warnings.append(
@@ -521,9 +542,8 @@ def check_mta_sts(domain):
         if mx_mismatch:
             if mode == 'enforce':
                 hard_errs.append(
-                    "MX mismatch in enforce mode — sending MTAs will reject "
-                    "connections to your mail server, causing legitimate mail "
-                    "delivery to fail"
+                    "MX mismatch in enforce mode — sending MTAs will reject connections "
+                    "to your mail server, causing legitimate mail delivery to fail"
                 )
             else:
                 warnings.append(
@@ -581,8 +601,8 @@ def _validate_bimi_svg(svg_text, content_type=""):
     Validate SVG against the BIMI SVG Tiny Portable/Secure (P/S) profile.
     Returns (issues, warnings, svg_suggestions).
     """
-    issues       = []
-    warnings     = []
+    issues          = []
+    warnings        = []
     svg_suggestions = []
 
     if content_type and 'image/svg+xml' not in content_type.lower():
@@ -591,7 +611,7 @@ def _validate_bimi_svg(svg_text, content_type=""):
             "(BIMI expects image/svg+xml)"
         )
         svg_suggestions.append(
-            f"Configure your web server to serve the SVG file with "
+            "Configure your web server to serve the SVG file with "
             "Content-Type: image/svg+xml"
         )
 
@@ -618,9 +638,7 @@ def _validate_bimi_svg(svg_text, content_type=""):
 
     if root.tag not in (f"{{{SVG_NS}}}svg", "svg"):
         issues.append(f"Root element is not <svg> (found: {root.tag})")
-        return issues, warnings, [
-            "The file root element must be <svg>. Ensure this is a valid SVG file."
-        ]
+        return issues, warnings, ["The file root element must be <svg>. Ensure this is a valid SVG file."]
 
     if not root.tag.startswith(f"{{{SVG_NS}}}"):
         declared = root.get('xmlns', '')
@@ -629,15 +647,11 @@ def _validate_bimi_svg(svg_text, content_type=""):
                 f"SVG namespace incorrect or missing "
                 f"(expected xmlns=\"{SVG_NS}\", found \"{declared}\")"
             )
-            svg_suggestions.append(
-                f'Add xmlns="{SVG_NS}" to the root <svg> element.'
-            )
+            svg_suggestions.append(f'Add xmlns="{SVG_NS}" to the root <svg> element.')
 
     version = root.get('version', '')
     if version != '1.2':
-        issues.append(
-            f"version must be '1.2' for SVG Tiny P/S (found: '{version}')"
-        )
+        issues.append(f"version must be '1.2' for SVG Tiny P/S (found: '{version}')")
         svg_suggestions.append(
             f'Set version="1.2" on the root <svg> element '
             f'(currently: "{version}" or missing). '
@@ -646,9 +660,7 @@ def _validate_bimi_svg(svg_text, content_type=""):
 
     base_profile = root.get('baseProfile', '')
     if base_profile.lower() != 'tiny-ps':
-        issues.append(
-            f"baseProfile must be 'tiny-ps' (found: '{base_profile}')"
-        )
+        issues.append(f"baseProfile must be 'tiny-ps' (found: '{base_profile}')")
         svg_suggestions.append(
             f'Set baseProfile="tiny-ps" on the root <svg> element '
             f'(currently: "{base_profile}" or missing). '
@@ -657,9 +669,7 @@ def _validate_bimi_svg(svg_text, content_type=""):
         )
 
     if root.get('x') is not None or root.get('y') is not None:
-        warnings.append(
-            "Root <svg> element has x= or y= attributes (invalid in Tiny P/S)"
-        )
+        warnings.append("Root <svg> element has x= or y= attributes (invalid in Tiny P/S)")
         svg_suggestions.append(
             "Remove the x= and y= attributes from the root <svg> tag. "
             "These are added automatically by Adobe Illustrator on SVG Tiny 1.2 "
@@ -701,9 +711,7 @@ def _validate_bimi_svg(svg_text, content_type=""):
             "avatar slots used by email clients."
         )
     elif par != 'xMidYMid meet':
-        warnings.append(
-            f"preserveAspectRatio is '{par}' (BIMI recommends 'xMidYMid meet')"
-        )
+        warnings.append(f"preserveAspectRatio is '{par}' (BIMI recommends 'xMidYMid meet')")
         svg_suggestions.append(
             f'Change preserveAspectRatio="{par}" to preserveAspectRatio="xMidYMid meet".'
         )
@@ -739,9 +747,7 @@ def _validate_bimi_svg(svg_text, content_type=""):
     if re.compile(
         r'<\s*(?:animate|animateMotion|animateTransform|set)\b', re.IGNORECASE
     ).search(svg_text):
-        issues.append(
-            "Animation elements are prohibited in SVG Tiny P/S"
-        )
+        issues.append("Animation elements are prohibited in SVG Tiny P/S")
         svg_suggestions.append(
             "Remove all animation elements: <animate>, <animateMotion>, "
             "<animateTransform>, and <set>. These are sometimes added by design "
@@ -750,9 +756,7 @@ def _validate_bimi_svg(svg_text, content_type=""):
 
     if re.search(r'<\s*foreignObject', svg_text, re.IGNORECASE):
         issues.append("<foreignObject> is prohibited in SVG Tiny P/S")
-        svg_suggestions.append(
-            "Remove all <foreignObject> elements from the SVG file."
-        )
+        svg_suggestions.append("Remove all <foreignObject> elements from the SVG file.")
 
     if re.compile(
         r'(?:href|src|xlink:href)\s*=\s*["\']https?://', re.IGNORECASE
@@ -822,7 +826,6 @@ def check_bimi(domain):
 
     overall = "ok"
 
-    # VMC (a= tag)
     if vmc_url:
         vmc_code, _ = fetch_url(vmc_url)
         if vmc_code == 200:
@@ -966,6 +969,197 @@ def check_bimi(domain):
 
 
 # ---------------------------------------------------------------------------
+# State tracking, audit logging, and notifications
+# ---------------------------------------------------------------------------
+
+def load_state(path, domain):
+    """
+    Load state file for the given domain. Returns a fresh state dict if the
+    file is absent, unreadable, or belongs to a different domain.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+        if data.get('domain') == domain:
+            return data
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+    return {'domain': domain, 'last_run': None, 'checks': {}}
+
+
+def save_state(path, state):
+    """Persist state to disk. Prints a warning on failure but never raises."""
+    try:
+        Path(path).write_text(json.dumps(state, indent=2))
+    except OSError as e:
+        print(f"  Warning: could not write state file {path}: {e}", file=sys.stderr)
+
+
+def append_audit_log(path, domain, timestamp, results_by_key):
+    """
+    Append a single JSON line to the audit log recording the outcome of
+    every check in this run.
+    """
+    entry = {
+        'timestamp': timestamp,
+        'domain':    domain,
+        'results':   {key: tup[2] for key, tup in results_by_key.items()},
+    }
+    try:
+        with open(path, 'a') as fh:
+            fh.write(json.dumps(entry) + '\n')
+    except OSError as e:
+        print(f"  Warning: could not write audit log {path}: {e}", file=sys.stderr)
+
+
+def send_ntfy(url, title, body, status):
+    """
+    POST a notification to an ntfy topic URL.
+    Failures are printed as warnings but never raise — a notification failure
+    must never abort the main script.
+    """
+    try:
+        requests.post(
+            url,
+            headers={
+                'Title':        title,
+                'Priority':     _NTFY_PRIORITY[status],
+                'Tags':         _NTFY_TAGS[status],
+                'Content-Type': 'text/plain; charset=utf-8',
+            },
+            data=body.encode('utf-8'),
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"  Warning: ntfy notification failed: {e}", file=sys.stderr)
+
+
+def ping_healthcheck(url):
+    """
+    Ping a healthchecks.io-compatible dead man's switch URL.
+    Called unconditionally at the end of every run so an alert fires if the
+    cron job itself stops executing.
+    """
+    try:
+        requests.get(url, timeout=10)
+    except requests.RequestException as e:
+        print(f"  Warning: healthcheck ping failed: {e}", file=sys.stderr)
+
+
+def process_state(domain, results_by_key, state, ntfy_url, now):
+    """
+    For each delivery-critical check, compare the current result against
+    saved state and apply the notification rules:
+
+      Degradation (green → amber/red):
+        Notification fires only if the check has been non-green for 2 or more
+        consecutive runs AND the episode originated from a green state.
+        warn → missing transitions are not re-notified.
+
+      Recovery (any non-green → green):
+        Notification fires immediately on the first green result.
+
+    State is updated in-place. Returns a list of human-readable strings
+    describing any notifications that were sent (for terminal display).
+    """
+    sent = []
+
+    for key in DELIVERY_CRITICAL_KEYS:
+        if key not in results_by_key:
+            continue
+
+        label, _, curr_status, _, _ = results_by_key[key]
+        prev = state['checks'].get(key)
+
+        # ── First run for this check: establish baseline, no notification ──
+        if prev is None:
+            state['checks'][key] = {
+                'status':                    curr_status,
+                'consecutive_non_green':     0 if curr_status == 'ok' else 1,
+                'episode_started_from_green': False,
+                'notified':                  False,
+                'last_changed':              now,
+                'last_run':                  now,
+            }
+            continue
+
+        prev_status = prev['status']
+
+        # ── Recovery ──────────────────────────────────────────────────────
+        if curr_status == 'ok':
+            if prev_status != 'ok':
+                msg = (
+                    f"{label} has returned to green for {domain}.\n"
+                    f"Previous status: {_STATUS_COLOUR[prev_status]}"
+                )
+                if ntfy_url:
+                    send_ntfy(
+                        ntfy_url,
+                        title=f"[RECOVERED] {label} - {domain}",
+                        body=msg,
+                        status='ok',
+                    )
+                sent.append(
+                    f"Recovery: {label} "
+                    f"({_STATUS_COLOUR[prev_status]} \u2192 green)"
+                )
+            state['checks'][key] = {
+                'status':                    'ok',
+                'consecutive_non_green':     0,
+                'episode_started_from_green': False,
+                'notified':                  False,
+                'last_changed': now if prev_status != 'ok' else prev.get('last_changed', now),
+                'last_run':                  now,
+            }
+            continue
+
+        # ── Non-green: determine whether this is a new episode from green ─
+        if prev_status == 'ok':
+            new_consecutive     = 1
+            started_from_green  = True
+        else:
+            new_consecutive    = prev.get('consecutive_non_green', 1) + 1
+            started_from_green = prev.get('episode_started_from_green', False)
+
+        already_notified = prev.get('notified', False)
+
+        should_notify = (
+            ntfy_url
+            and started_from_green
+            and not already_notified
+            and new_consecutive >= 2
+        )
+
+        if should_notify:
+            colour_label = _STATUS_COLOUR[curr_status]
+            msg = (
+                f"{label} has degraded from green to {colour_label} for {domain}.\n"
+                f"Confirmed on {new_consecutive} consecutive checks.\n"
+                "Review your DNS configuration."
+            )
+            send_ntfy(
+                ntfy_url,
+                title=f"[ALERT] {label} degraded - {domain}",
+                body=msg,
+                status=curr_status,
+            )
+            sent.append(
+                f"Degradation alert: {label} "
+                f"(green \u2192 {colour_label}, {new_consecutive} consecutive runs)"
+            )
+
+        state['checks'][key] = {
+            'status':                    curr_status,
+            'consecutive_non_green':     new_consecutive,
+            'episode_started_from_green': started_from_green,
+            'notified':                  already_notified or bool(should_notify),
+            'last_changed': now if prev_status != curr_status else prev.get('last_changed', now),
+            'last_run':                  now,
+        }
+
+    return sent
+
+
+# ---------------------------------------------------------------------------
 # Output renderers
 # ---------------------------------------------------------------------------
 
@@ -981,7 +1175,6 @@ def print_terminal_result(label, records, status, summary, suggestions):
     if suggestions:
         print(f"  {CYAN}How to fix:{RESET}")
         for suggestion in suggestions:
-            # Wrap long suggestions at ~76 chars for readability
             lines = suggestion.splitlines()
             for i, line in enumerate(lines):
                 prefix = f"  {CYAN}   [i] " if i == 0 else f"  {CYAN}       "
@@ -1030,24 +1223,13 @@ def generate_html_report(domain, results):
             f"<li>{html_lib.escape(str(r))}</li>" for r in records
         )
 
-        # "How to fix" box — only rendered when there are suggestions
         if suggestions:
             fix_items = "\n        ".join(
                 f"<li>{html_lib.escape(str(s))}</li>" for s in suggestions
             )
             fix_box = f"""
-    <div style="
-        background:#f0f9ff;
-        border:1px solid #bae6fd;
-        border-left:3px solid #0284c7;
-        border-radius:4px;
-        padding:12px 16px;
-        margin-top:14px;
-    ">
-      <div style="font-size:0.78rem;font-weight:700;color:#0369a1;
-                  letter-spacing:0.04em;margin-bottom:6px;">
-        HOW TO FIX
-      </div>
+    <div style="background:#f0f9ff;border:1px solid #bae6fd;border-left:3px solid #0284c7;border-radius:4px;padding:12px 16px;margin-top:14px;">
+      <div style="font-size:0.78rem;font-weight:700;color:#0369a1;letter-spacing:0.04em;margin-bottom:6px;">HOW TO FIX</div>
       <ul style="margin:0;padding-left:18px;color:#0c4a6e;font-size:0.82rem;line-height:1.75;">
         {fix_items}
       </ul>
@@ -1055,7 +1237,8 @@ def generate_html_report(domain, results):
         else:
             fix_box = ""
 
-        cards.append(f"""  <div style="background:{bg};border-left:4px solid {bc};border-radius:6px;padding:18px 22px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.07);">
+        cards.append(
+            f"""  <div style="background:{bg};border-left:4px solid {bc};border-radius:6px;padding:18px 22px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.07);">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;gap:12px;">
       <span style="font-weight:600;font-size:0.95rem;color:#1e293b;">{html_lib.escape(label)}</span>
       <span style="background:{bbg};color:{btc};border:1px solid {bc};border-radius:12px;padding:2px 11px;font-size:0.75rem;font-weight:700;letter-spacing:0.05em;white-space:nowrap;flex-shrink:0;">{sym} {lbl}</span>
@@ -1064,7 +1247,8 @@ def generate_html_report(domain, results):
     <ul style="margin:0;padding-left:18px;color:#374151;font-size:0.82rem;line-height:1.75;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;">
       {items_html}
     </ul>{fix_box}
-  </div>""")
+  </div>"""
+        )
 
     cards_str = "\n".join(cards)
 
@@ -1092,97 +1276,42 @@ def generate_html_report(domain, results):
     padding: 22px 28px;
     margin-bottom: 18px;
   }}
-  .hdr-label {{
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: #64748b;
-    margin-bottom: 6px;
-  }}
-  .hdr-domain {{
-    font-size: 1.45rem;
-    font-weight: 800;
-    color: #e2e8f0;
-    word-break: break-all;
-  }}
-  .hdr-meta {{
-    margin-top: 8px;
-    font-size: 0.8rem;
-    color: #64748b;
-  }}
+  .hdr-label {{ font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em; color: #64748b; margin-bottom: 6px; }}
+  .hdr-domain {{ font-size: 1.45rem; font-weight: 800; color: #e2e8f0; word-break: break-all; }}
+  .hdr-meta {{ margin-top: 8px; font-size: 0.8rem; color: #64748b; }}
   .posture {{
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    border-radius: 6px;
-    padding: 12px 18px;
-    margin-bottom: 16px;
-    border-left: 4px solid {posture_border};
-    background: {posture_bg};
-    color: {posture_color};
-    font-weight: 600;
-    font-size: 0.9rem;
-    flex-wrap: wrap;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; border-radius: 6px; padding: 12px 18px; margin-bottom: 16px;
+    border-left: 4px solid {posture_border}; background: {posture_bg};
+    color: {posture_color}; font-weight: 600; font-size: 0.9rem; flex-wrap: wrap;
   }}
-  .posture-counts {{
-    font-weight: 400;
-    color: #64748b;
-    font-size: 0.82rem;
-  }}
-  .legend {{
-    display: flex;
-    gap: 18px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }}
-  .legend-item {{
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 0.8rem;
-    color: #64748b;
-  }}
-  .legend-dot {{
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }}
-  .footer {{
-    margin-top: 32px;
-    text-align: center;
-    font-size: 0.75rem;
-    color: #94a3b8;
-  }}
+  .posture-counts {{ font-weight: 400; color: #64748b; font-size: 0.82rem; }}
+  .legend {{ display: flex; gap: 18px; margin-bottom: 20px; flex-wrap: wrap; }}
+  .legend-item {{ display: flex; align-items: center; gap: 7px; font-size: 0.8rem; color: #64748b; }}
+  .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }}
+  .footer {{ margin-top: 32px; text-align: center; font-size: 0.75rem; color: #94a3b8; }}
 </style>
 </head>
 <body>
 <div class="wrap">
-
   <div class="hdr">
     <div class="hdr-label">DNS Email Security Report</div>
     <div class="hdr-domain">{html_lib.escape(domain)}</div>
     <div class="hdr-meta">Generated {timestamp}</div>
   </div>
-
   <div class="posture">
     <span>Overall posture: {html_lib.escape(posture_msg)}</span>
     <span class="posture-counts">{n_pass} pass &nbsp;/&nbsp; {n_warn} warn &nbsp;/&nbsp; {n_fail} fail</span>
   </div>
-
   <div class="legend">
     <div class="legend-item"><div class="legend-dot" style="background:#16a34a;"></div>Pass &mdash; correctly configured</div>
     <div class="legend-item"><div class="legend-dot" style="background:#d97706;"></div>Warning &mdash; present but suboptimal</div>
     <div class="legend-item"><div class="legend-dot" style="background:#dc2626;"></div>Fail &mdash; missing or critically misconfigured</div>
   </div>
-
 {cards_str}
-
   <div class="footer">
     Generated by check_dns &mdash; MX &middot; SPF &middot; DKIM &middot; DMARC &middot; MTA-STS &middot; BIMI
   </div>
-
 </div>
 </body>
 </html>"""
@@ -1193,6 +1322,8 @@ def generate_html_report(domain, results):
 # ---------------------------------------------------------------------------
 
 def main():
+    default_state_file = str(Path(__file__).parent / 'check_dns_state.json')
+
     parser = argparse.ArgumentParser(
         description="Check email-related DNS records and security policy configuration.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1200,37 +1331,102 @@ def main():
             "Examples:\n"
             "  %(prog)s example.com\n"
             "  %(prog)s example.com --html > report.html\n"
+            "  %(prog)s example.com --ntfy-url https://ntfy.sh/my-topic\n"
+            "  %(prog)s example.com --html --ntfy-url https://ntfy.sh/my-topic "
+            "--audit-log /var/log/dns_audit.jsonl "
+            "--healthcheck-url https://hc-ping.com/your-uuid "
+            "> /var/www/html/dns-report/index.html\n"
         )
     )
-    parser.add_argument("domain", nargs="?", help="Domain name to check")
     parser.add_argument(
-        "--html",
-        action="store_true",
+        "domain", nargs="?",
+        help="Domain name to check"
+    )
+    parser.add_argument(
+        "--html", action="store_true",
         help=(
             "Output a self-contained HTML report instead of terminal output. "
             "Pipe to a file: check_dns.py example.com --html > report.html"
         ),
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--state-file", default=default_state_file, metavar="PATH",
+        help=(
+            "Path to the JSON state file used to detect status regressions. "
+            f"Defaults to check_dns_state.json in the script directory. "
+            "Created automatically on first run."
+        ),
+    )
+    parser.add_argument(
+        "--audit-log", default=None, metavar="PATH",
+        help=(
+            "Path to an append-only JSON lines audit log recording the result "
+            "of every check on every run. Optional."
+        ),
+    )
+    parser.add_argument(
+        "--ntfy-url", default=None, metavar="URL",
+        help=(
+            "ntfy topic URL to receive push notifications when a "
+            "delivery-critical check (MX, SPF, DKIM, DMARC, MTA-STS) degrades "
+            "from green to amber/red (confirmed over 2 consecutive runs), or "
+            "recovers back to green. "
+            "Example: https://ntfy.sh/my-dns-alerts or "
+            "http://ntfy.yourdomain.com/my-topic"
+        ),
+    )
+    parser.add_argument(
+        "--healthcheck-url", default=None, metavar="URL",
+        help=(
+            "healthchecks.io-compatible ping URL. Sent as an unconditional GET "
+            "request at the end of every successful run, providing a dead man's "
+            "switch to alert you if the cron job itself stops running. "
+            "Example: https://hc-ping.com/your-uuid"
+        ),
+    )
 
+    args   = parser.parse_args()
     domain = args.domain or input("Enter domain to check: ").strip()
 
     dkim_selectors = check_dkim.__defaults__[0]
-    dkim_label = f"DKIM Record (selectors: {', '.join(dkim_selectors)})"
+    dkim_label     = f"DKIM Record (selectors: {', '.join(dkim_selectors)})"
 
+    # Each entry: (display_label, state_key, check_function)
     checks = [
-        ("MX Records",   check_mx),
-        ("SPF Record",   check_spf),
-        (dkim_label,     check_dkim),
-        ("DMARC Record", check_dmarc),
-        ("MTA-STS Record", check_mta_sts),
-        ("BIMI Record",  check_bimi),
+        ("MX Records",     "mx",      check_mx),
+        ("SPF Record",     "spf",     check_spf),
+        (dkim_label,       "dkim",    check_dkim),
+        ("DMARC Record",   "dmarc",   check_dmarc),
+        ("MTA-STS Record", "mta_sts", check_mta_sts),
+        ("BIMI Record",    "bimi",    check_bimi),
     ]
 
-    gathered = []
-    for label, check_func in checks:
+    # Run all checks
+    results_by_key = {}
+    for label, key, check_func in checks:
         records, status, summary, suggestions = check_func(domain)
-        gathered.append((label, records, status, summary, suggestions))
+        results_by_key[key] = (label, records, status, summary, suggestions)
+
+    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+    # State tracking and notifications
+    state         = load_state(args.state_file, domain)
+    notifications = process_state(domain, results_by_key, state, args.ntfy_url, now)
+    state['last_run'] = now
+    save_state(args.state_file, state)
+
+    # Audit log
+    if args.audit_log:
+        append_audit_log(args.audit_log, domain, now, results_by_key)
+
+    # Dead man's switch
+    if args.healthcheck_url:
+        ping_healthcheck(args.healthcheck_url)
+
+    # Build ordered list for renderers
+    gathered = []
+    for label, key, _ in checks:
+        gathered.append(results_by_key[key])
 
     if args.html:
         print(generate_html_report(domain, gathered))
@@ -1241,6 +1437,10 @@ def main():
         print(sep)
         for label, records, status, summary, suggestions in gathered:
             print_terminal_result(label, records, status, summary, suggestions)
+        if notifications:
+            print(f"\n{CYAN}  Notifications sent this run:{RESET}")
+            for note in notifications:
+                print(f"  {CYAN}  \u2192 {note}{RESET}")
         print()
 
 
