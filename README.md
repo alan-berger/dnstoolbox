@@ -2,6 +2,14 @@
 
 A Python command-line tool that performs comprehensive validation of email-related DNS records and security policies. Results are presented with a traffic light system — green, amber, red — each accompanied by a plain-English explanation of the result and, where applicable, actionable suggestions for remediation.
 
+![Python Version](https://img.shields.io/badge/python-%3E%3D3.8-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Checks](https://img.shields.io/badge/checks-MX%20%7C%20SPF%20%7C%20DKIM%20%7C%20DMARC%20%7C%20MTA--STS%20%7C%20BIMI-blue)
+![Security](https://img.shields.io/badge/security-SSRF%20%2B%20XSS%20%2B%20input%20sanitisation-brightgreen)
+![Output](https://img.shields.io/badge/output-terminal%20%2B%20HTML%20report-informational)
+![Notifications](https://img.shields.io/badge/notifications-ntfy.sh-important)
+![State Tracking](https://img.shields.io/badge/state%20tracking-2--run%20regression%20detection-yellow)
+
 The tool can output directly to the terminal or produce a self-contained HTML report suitable for hosting on a website. Combined with a cron job, it provides continuous monitoring with push notifications via [ntfy](https://ntfy.sh) when a delivery-critical check degrades from green, and a recovery alert when it returns to green.
 
 ---
