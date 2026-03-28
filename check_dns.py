@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import html as html_lib
+import ipaddress
 import json
 import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import dns.resolver
 import requests
@@ -26,13 +28,161 @@ _STATUS_LABEL   = {'ok': 'PASS', 'warn': 'WARNING', 'missing': 'FAIL'}
 _STATUS_COLOUR  = {'ok': 'green', 'warn': 'amber', 'missing': 'red'}
 
 # ---------------------------------------------------------------------------
-# HTML colour palette
+# HTML colour palette (used by the self-contained HTML report renderer)
 # ---------------------------------------------------------------------------
 _HTML_TEXT       = {'ok': '#14532d', 'warn': '#78350f', 'missing': '#7f1d1d'}
 _HTML_BORDER     = {'ok': '#16a34a', 'warn': '#d97706', 'missing': '#dc2626'}
 _HTML_BG         = {'ok': '#f0fdf4', 'warn': '#fffbeb', 'missing': '#fef2f2'}
 _HTML_BADGE_BG   = {'ok': '#dcfce7', 'warn': '#fef3c7', 'missing': '#fee2e2'}
 _HTML_BADGE_TEXT = {'ok': '#15803d', 'warn': '#b45309', 'missing': '#b91c1c'}
+
+# ---------------------------------------------------------------------------
+# Input validation and sanitisation
+#
+# DNS data ultimately reaches the HTML output via html_lib.escape() in
+# generate_html_report(), which is the primary XSS defence. The functions
+# below provide a second, independent layer applied at the point of ingestion:
+#
+#   validate_domain()       — called once at startup before any DNS queries.
+#   _sanitise_dns_value()   — applied to every raw DNS record value returned
+#                             by get_dns_records().
+#   _sanitise_tag_value()   — caps short values extracted from DNS record tags
+#                             (e.g. DMARC p=, MTA-STS mode:) before they are
+#                             interpolated into human-readable messages.
+#   _validate_fetch_url()   — validates URLs extracted from DNS records before
+#                             they are passed to requests.get(). This prevents
+#                             SSRF: an attacker who controls your DNS could
+#                             otherwise set BIMI l= to an internal metadata
+#                             endpoint (e.g. http://169.254.169.254/...) or a
+#                             file:// URI.
+# ---------------------------------------------------------------------------
+
+# RFC 1035 §2.3.4 + RFC 5321: labels max 63 chars, total max 253 chars.
+_DOMAIN_RE = re.compile(
+    r'^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$',
+    re.IGNORECASE,
+)
+
+_MAX_DNS_VALUE_LEN = 2048   # per-record cap (single TXT RR theoretical max is 65535 B)
+_MAX_HTTP_BODY     = 65536  # 64 KB — MTA-STS policies and BIMI SVGs are tiny in practice
+_MAX_URL_LEN       = 2048   # cap on URLs extracted from DNS records
+_MAX_TAG_VALUE_LEN = 64     # cap on short tag values embedded in messages
+
+# Hostnames / patterns that must never be fetched (SSRF guards)
+_BLOCKED_HOST_RE = re.compile(
+    r'^(?:localhost|.*\.local|.*\.internal|.*\.localdomain|.*\.arpa)$',
+    re.IGNORECASE,
+)
+
+
+def validate_domain(domain: str) -> str:
+    """
+    Validate and normalise a domain name.
+
+    Returns the lowercased, trailing-dot-stripped domain on success, or
+    raises ValueError with a human-readable message on failure.  Called
+    once at startup before any DNS queries or HTML generation.
+    """
+    domain = domain.strip().lower().rstrip('.')
+    if not domain:
+        raise ValueError("Domain name cannot be empty.")
+    if len(domain) > 253:
+        raise ValueError(
+            f"Domain name is too long ({len(domain)} chars; RFC 1035 maximum is 253)."
+        )
+    if not _DOMAIN_RE.match(domain):
+        raise ValueError(
+            f"Invalid domain name: {domain!r}. "
+            "Only letters, digits, hyphens, and dots are permitted."
+        )
+    return domain
+
+
+def _sanitise_dns_value(value: str, max_len: int = _MAX_DNS_VALUE_LEN) -> str:
+    """
+    Sanitise a single DNS record value before it enters the processing pipeline.
+
+    Strips non-printable characters (they have no legitimate place in DNS
+    record values and could confuse downstream string handling), then caps
+    the length so a crafted large TXT record cannot bloat the HTML output.
+    Applied to every value returned by get_dns_records().
+    """
+    value = ''.join(ch for ch in value if ch.isprintable())
+    if len(value) > max_len:
+        value = value[:max_len] + f' … [value truncated: {len(value) - max_len} chars omitted]'
+    return value
+
+
+def _sanitise_tag_value(value: str, max_len: int = _MAX_TAG_VALUE_LEN) -> str:
+    """
+    Cap and strip a short tag value (e.g. DMARC p=, MTA-STS mode:) before
+    it is interpolated into a human-readable diagnostic message.
+
+    The value has already been through _sanitise_dns_value at the DNS layer
+    (for DNS-sourced data) or via HTTP body capping (for policy-file data).
+    This extra cap keeps error messages readable and provides defence-in-depth
+    in case the value reaches this point via an unexpected code path.
+    """
+    value = ''.join(ch for ch in value if ch.isprintable())
+    if len(value) > max_len:
+        value = value[:max_len] + '…'
+    return value
+
+
+def _validate_fetch_url(url: str) -> tuple:
+    """
+    Validate that a URL extracted from a DNS record is safe to fetch.
+
+    Returns (True, '') on success or (False, reason_str) on failure.
+
+    Accepts only HTTPS URLs with a valid public hostname.  Blocks:
+      - Non-HTTPS schemes (http://, file://, ftp://, etc.)
+      - IP address hostnames (prevents metadata-service SSRF on cloud hosts)
+      - Loopback, link-local, private ranges (via ipaddress module)
+      - Localhost / .local / .internal / .arpa hostnames
+      - URLs exceeding _MAX_URL_LEN characters
+    """
+    if not url:
+        return False, "URL is empty."
+    if len(url) > _MAX_URL_LEN:
+        return False, (
+            f"URL length ({len(url)} chars) exceeds the maximum permitted "
+            f"({_MAX_URL_LEN} chars)."
+        )
+
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        return False, f"URL could not be parsed: {exc}"
+
+    if parsed.scheme != 'https':
+        return False, (
+            f"Only HTTPS URLs are permitted in DNS records; "
+            f"got scheme '{parsed.scheme}'."
+        )
+
+    hostname = parsed.hostname or ''
+    if not hostname:
+        return False, "URL contains no hostname."
+
+    # Block IP address literals — both IPv4 and IPv6.
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_reserved:
+            return False, (
+                f"URL hostname '{hostname}' resolves to a non-public address range."
+            )
+        return False, (
+            f"URL hostname must be a domain name, not an IP address ('{hostname}')."
+        )
+    except ValueError:
+        pass  # Not an IP address — that is what we want.
+
+    if _BLOCKED_HOST_RE.match(hostname):
+        return False, f"URL hostname '{hostname}' is not permitted."
+
+    return True, ''
+
 
 # ---------------------------------------------------------------------------
 # Delivery-critical checks — the only ones tracked for state changes and
@@ -69,7 +219,7 @@ _resolver.cache = None
 def get_dns_records(domain, record_type):
     try:
         answers = _resolver.resolve(domain, record_type)
-        return [rdata.to_text().strip('"') for rdata in answers]
+        return [_sanitise_dns_value(rdata.to_text().strip('"')) for rdata in answers]
     except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout):
         return []
 
@@ -77,8 +227,8 @@ def get_dns_records(domain, record_type):
 def fetch_url(url):
     """Returns (status_code, body) or (None, error_str)."""
     try:
-        r = requests.get(url, headers=_HTTP_HEADERS, timeout=5, allow_redirects=True)
-        return r.status_code, r.text
+        r = requests.get(url, headers=_HTTP_HEADERS, timeout=10, allow_redirects=True)
+        return r.status_code, r.text[:_MAX_HTTP_BODY]
     except requests.RequestException as e:
         return None, str(e)
 
@@ -86,8 +236,8 @@ def fetch_url(url):
 def fetch_url_full(url):
     """Returns (status_code, headers_dict, body) or (None, {}, error_str)."""
     try:
-        r = requests.get(url, headers=_HTTP_HEADERS, timeout=5, allow_redirects=True)
-        return r.status_code, dict(r.headers), r.text
+        r = requests.get(url, headers=_HTTP_HEADERS, timeout=10, allow_redirects=True)
+        return r.status_code, dict(r.headers), r.text[:_MAX_HTTP_BODY]
     except requests.RequestException as e:
         return None, {}, str(e)
 
@@ -310,10 +460,10 @@ def check_dmarc(domain):
     return (
         records,
         "warn",
-        f"DMARC policy value '{policy}' is not recognised. "
+        f"DMARC policy value '{_sanitise_tag_value(policy)}' is not recognised. "
         "Expected: none, quarantine, or reject.",
         [
-            f"Check your DMARC record for a typo in the p= tag (found: '{policy}'). "
+            f"Check your DMARC record for a typo in the p= tag (found: '{_sanitise_tag_value(policy)}'). "
             "Valid values are: none, quarantine, reject.",
             "Retrieve your current record with: dig TXT _dmarc.yourdomain.com",
         ],
@@ -456,10 +606,12 @@ def check_mta_sts(domain):
         )
     else:
         hard_errs.append(
-            f"Mode: unrecognised value '{mode}' (expected: enforce, testing, or none)"
+            f"Mode: unrecognised value '{_sanitise_tag_value(mode)}' "
+            "(expected: enforce, testing, or none)"
         )
         suggestions.append(
-            f"Fix the mode field in your policy file. Found '{mode}'; "
+            f"Fix the mode field in your policy file. "
+            f"Found '{_sanitise_tag_value(mode)}'; "
             "valid values are: enforce, testing, none."
         )
 
@@ -501,12 +653,13 @@ def check_mta_sts(domain):
                 f"{max_age // 86400} day(s)"
             )
     except (ValueError, TypeError):
+        _raw_max_age = _sanitise_tag_value(str(policy.get('max_age', '')))
         hard_errs.append(
-            f"max_age: invalid non-integer value '{policy.get('max_age')}'"
+            f"max_age: invalid non-integer value '{_raw_max_age}'"
         )
         suggestions.append(
             "Ensure max_age is a plain integer (number of seconds), "
-            f"e.g.: max_age: 86400 — found: '{policy.get('max_age')}'"
+            f"e.g.: max_age: 86400 — found: '{_raw_max_age}'"
         )
 
     # MX alignment
@@ -827,33 +980,44 @@ def check_bimi(domain):
     overall = "ok"
 
     if vmc_url:
-        vmc_code, _ = fetch_url(vmc_url)
-        if vmc_code == 200:
+        url_ok, url_reason = _validate_fetch_url(vmc_url)
+        if not url_ok:
             results.append(
-                f"VMC certificate accessible at {vmc_url} — "
-                "Gmail and Apple Mail will display this logo"
-            )
-        elif vmc_code is not None:
-            results.append(
-                f"VMC certificate URL returned HTTP {vmc_code} — "
-                "logo will not display in Gmail or Apple Mail until the "
-                "VMC file is accessible"
+                f"VMC URL in BIMI record is invalid and was not fetched: {url_reason}"
             )
             overall = "warn"
             suggestions.append(
-                f"The VMC file at {vmc_url} returned HTTP {vmc_code}. "
-                "Ensure the .pem file is publicly accessible over HTTPS."
+                f"The a= value in your BIMI record must be a valid public HTTPS URL. "
+                f"Problem: {url_reason}"
             )
         else:
-            results.append(
-                "VMC certificate URL is unreachable — verify it is hosted "
-                "and publicly accessible over HTTPS"
-            )
-            overall = "warn"
-            suggestions.append(
-                f"The VMC URL could not be reached. Verify DNS resolution and "
-                f"that the file is served at: {vmc_url}"
-            )
+            vmc_code, _ = fetch_url(vmc_url)
+            if vmc_code == 200:
+                results.append(
+                    f"VMC certificate accessible at {vmc_url} — "
+                    "Gmail and Apple Mail will display this logo"
+                )
+            elif vmc_code is not None:
+                results.append(
+                    f"VMC certificate URL returned HTTP {vmc_code} — "
+                    "logo will not display in Gmail or Apple Mail until the "
+                    "VMC file is accessible"
+                )
+                overall = "warn"
+                suggestions.append(
+                    f"The VMC file at {vmc_url} returned HTTP {vmc_code}. "
+                    "Ensure the .pem file is publicly accessible over HTTPS."
+                )
+            else:
+                results.append(
+                    "VMC certificate URL is unreachable — verify it is hosted "
+                    "and publicly accessible over HTTPS"
+                )
+                overall = "warn"
+                suggestions.append(
+                    f"The VMC URL could not be reached. Verify DNS resolution and "
+                    f"that the file is served at: {vmc_url}"
+                )
     else:
         results.append(
             "No VMC (a=) in BIMI record — logo will not display in Gmail or "
@@ -888,6 +1052,23 @@ def check_bimi(domain):
                 "DNS record, e.g.: v=BIMI1; l=https://yourdomain.com/bimi/logo.svg",
                 "The SVG must be served over HTTPS and conform to the BIMI "
                 "SVG Tiny P/S specification.",
+            ],
+        )
+
+    status_code, headers, body = None, {}, ''
+    url_ok, url_reason = _validate_fetch_url(logo_url)
+    if not url_ok:
+        results.append(
+            f"BIMI logo URL (l=) is invalid and was not fetched: {url_reason}"
+        )
+        return (
+            results,
+            "missing",
+            "BIMI logo URL is invalid and cannot be fetched.",
+            suggestions + [
+                f"The l= value in your BIMI record must be a valid public HTTPS URL. "
+                f"Problem: {url_reason}",
+                "Example: v=BIMI1; l=https://yourdomain.com/bimi/logo.svg",
             ],
         )
 
@@ -1184,7 +1365,9 @@ def print_terminal_result(label, records, status, summary, suggestions):
 def generate_html_report(domain, results):
     """
     results: list of (label, records, status, summary, suggestions)
-    Returns a complete, self-contained HTML string.
+    Returns a complete, self-contained HTML string with no external
+    dependencies — all styling is inline CSS.  Can be opened directly in a
+    browser, served as a static file, or embedded into an existing page.
     """
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
@@ -1244,7 +1427,7 @@ def generate_html_report(domain, results):
       <span style="background:{bbg};color:{btc};border:1px solid {bc};border-radius:12px;padding:2px 11px;font-size:0.75rem;font-weight:700;letter-spacing:0.05em;white-space:nowrap;flex-shrink:0;">{sym} {lbl}</span>
     </div>
     <p style="margin:0 0 12px 0;color:{tc};font-size:0.9rem;line-height:1.55;">{html_lib.escape(summary)}</p>
-    <ul style="margin:0;padding-left:18px;color:#374151;font-size:0.82rem;line-height:1.75;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;">
+    <ul style="margin:0;padding-left:18px;color:#374151;font-size:0.82rem;line-height:1.75;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;overflow-wrap:break-word;word-break:break-all;">
       {items_html}
     </ul>{fix_box}
   </div>"""
@@ -1386,7 +1569,12 @@ def main():
     )
 
     args   = parser.parse_args()
-    domain = args.domain or input("Enter domain to check: ").strip()
+    raw_domain = args.domain or input("Enter domain to check: ").strip()
+    try:
+        domain = validate_domain(raw_domain)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     dkim_selectors = check_dkim.__defaults__[0]
     dkim_label     = f"DKIM Record (selectors: {', '.join(dkim_selectors)})"
