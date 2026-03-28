@@ -39,7 +39,7 @@ Non-green results include a "How to fix" section with specific, actionable steps
 - [`dnspython`](https://www.dnspython.org/)
 - [`requests`](https://requests.readthedocs.io/)
 
-No other third-party dependencies are required. The HTML report and all notification logic use Python's standard library only.
+No other third-party dependencies are required. The HTML report, notification logic, and all input validation use Python's standard library only (`ipaddress`, `urllib.parse`, `xml.etree.ElementTree`, `re`, `json`).
 
 ---
 
@@ -97,6 +97,26 @@ The output is a fully self-contained HTML file with no external dependencies —
 | `--audit-log PATH` | none | Path to an append-only JSON lines file recording every check result on every run |
 | `--ntfy-url URL` | none | ntfy topic URL for push notifications on status changes |
 | `--healthcheck-url URL` | none | healthchecks.io-compatible ping URL, sent at the end of every successful run |
+
+---
+
+## Security Hardening
+
+The script treats DNS record data as untrusted input throughout. This is relevant in any scenario where access to your DNS provider's console could be compromised — for example if an attacker modified your TXT records, the data returned by DNS queries would be attacker-controlled. The following defences are applied:
+
+**Domain validation** — the domain argument is validated against RFC 1035/5321 rules (letters, digits, hyphens, dots; labels ≤ 63 chars; total ≤ 253 chars) before any DNS queries are made. Malformed input causes an immediate exit with a clear error message.
+
+**DNS record sanitisation** — every raw DNS record value is stripped of non-printable characters and capped at 2 KB before it enters the processing pipeline. A crafted oversized TXT record cannot bloat the HTML output.
+
+**HTTP response body cap** — responses from `fetch_url()` (used for the MTA-STS policy file and BIMI logo SVG) are capped at 64 KB. Servers you do not control cannot return unbounded data.
+
+**SSRF prevention** — URLs extracted from DNS records (BIMI `l=` logo URL and `a=` VMC URL) are validated before any HTTP request is made. Only HTTPS URLs with a valid public domain hostname are permitted. Blocked: non-HTTPS schemes (`http://`, `file://`, etc.), IP address literals, private/loopback/link-local ranges, and reserved hostnames such as `localhost`, `*.local`, and `*.internal`. This prevents an attacker who controls your DNS from redirecting the script to internal network endpoints or cloud metadata services.
+
+**HTML output escaping** — all DNS-derived data is passed through `html.escape()` before being written into HTML output. This is the primary XSS defence and applies to every user-visible string in the report.
+
+**Short tag value capping** — values extracted from DNS record tags (DMARC `p=`, MTA-STS `mode:`, etc.) are additionally capped at 64 characters when interpolated into diagnostic messages, providing defence in depth.
+
+**No use of `eval`, `exec`, or unsafe deserialisers** — DNS data is used only as the subject of string operations. There is no path from DNS record content to Python code execution. The only "interpreter" that processes attacker-influenced data is `xml.etree.ElementTree`, which does not support external entity expansion (XXE) by design.
 
 ---
 
@@ -335,6 +355,8 @@ The check validates:
 
 **VMC (Verified Mark Certificate, `a=`)** — a VMC is issued by a Certificate Authority (currently DigiCert) and cryptographically links your logo to your domain. Gmail and Apple Mail require a VMC before they will display the logo. Yahoo Mail and Fastmail support self-asserted BIMI without a VMC. The absence of a VMC is flagged amber rather than red — the configuration is valid for a subset of providers.
 
+**Logo URL validation** — before fetching the logo, the `l=` URL is validated: only HTTPS URLs with a public domain hostname are permitted. This prevents SSRF if the DNS record is tampered with.
+
 **Logo reachability** — the SVG file at the `l=` URL is fetched and must return HTTP 200.
 
 **SVG Tiny P/S validation** — the BIMI specification requires logos to conform to the SVG Tiny Portable/Secure (P/S) profile, a restricted subset of SVG Tiny 1.2 designed to be safe for display in email clients. The following are checked:
@@ -375,10 +397,11 @@ dig TXT _dmarc.example.com @1.1.1.1
 ## Limitations
 
 - DKIM selector detection only tests the selectors defined in `check_dkim()`. If your provider uses a different selector the check will return red even if DKIM is correctly configured. See the DKIM section above for how to identify and add your selector.
-- HTTP requests use a 5-second timeout. Slow or firewalled endpoints may be reported as unreachable.
+- HTTP requests use a 10-second timeout. Slow or firewalled endpoints may be reported as unreachable.
 - DMARC `pct=` (percentage) and `fo=` (failure options) tags are not evaluated.
 - MTA-STS SMTP TLS reporting (`_smtp._tls.<domain>`) is not checked.
 - The state file tracks one domain per file. Use `--state-file` to specify separate files when monitoring multiple domains.
+- BIMI and MTA-STS logo/policy HTTP fetches are limited to 64 KB response bodies. Responses larger than this are truncated before parsing.
 
 ---
 
