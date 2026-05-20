@@ -3,10 +3,7 @@
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Maintained](https://img.shields.io/badge/maintained-yes-green.svg)](https://github.com/alan-berger/dnstoolbox/commits/main)
-[![RFCs](https://img.shields.io/badge/RFCs-7208%20%7C%208461%20%7C%204034%20%7C%206698%20%7C%206844-blueviolet)](#standards--rfcs)
-[![GitHub last commit](https://img.shields.io/github/last-commit/alan-berger/dnstoolbox)](https://github.com/alan-berger/dnstoolbox/commits/main)
-[![GitHub issues](https://img.shields.io/github/issues/alan-berger/dnstoolbox)](https://github.com/alan-berger/dnstoolbox/issues)
-[![GitHub stars](https://img.shields.io/github/stars/alan-berger/dnstoolbox?style=social)](https://github.com/alan-berger/dnstoolbox/stargazers)
+![Checks](https://img.shields.io/badge/checks-MX%20%7C%20SPF%20%7C%20DKIM%20%7C%20DMARC%20%7C%20MTA--STS%20%7C%20DNSSEC%20%7C%20DANE%20%7C%20CAA%20%7C%20BIMI-blue)
 
 `check_dns.py` is a single-file Python tool that audits a domain's email-related DNS records and security policies, then reports each finding as **pass / warning / fail** with a one-sentence summary and actionable fix steps. It is designed to be run from the command line, on a cron schedule, or piped into a static HTML report.
 
