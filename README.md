@@ -4,7 +4,7 @@ A Python command-line tool that performs comprehensive validation of email-relat
 
 ![Python Version](https://img.shields.io/badge/python-%3E%3D3.8-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Checks](https://img.shields.io/badge/checks-MX%20%7C%20SPF%20%7C%20DKIM%20%7C%20DMARC%20%7C%20MTA--STS%20%7C%20BIMI-blue)
+![Checks](https://img.shields.io/badge/checks-MX%20%7C%20SPF%20%7C%20DKIM%20%7C%20DMARC%20%7C%20MTA--STS%20%7C%20DNSSEC%20%7C%20DANE%20%7C%20CAA%20%7C%20BIMI-blue)
 ![Security](https://img.shields.io/badge/security-SSRF%20%2B%20XSS%20%2B%20input%20sanitisation-brightgreen)
 ![Output](https://img.shields.io/badge/output-terminal%20%2B%20HTML%20report-informational)
 ![Notifications](https://img.shields.io/badge/notifications-ntfy.sh-important)
