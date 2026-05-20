@@ -1,440 +1,178 @@
-# DNS Email Security Checker
+# dnstoolbox — check_dns
 
-A Python command-line tool that performs comprehensive validation of email-related DNS records and security policies. Results are presented with a traffic light system — green, amber, red — each accompanied by a plain-English explanation of the result and, where applicable, actionable suggestions for remediation.
+[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![Maintained](https://img.shields.io/badge/maintained-yes-green.svg)](https://github.com/alan-berger/dnstoolbox/commits/main)
+[![RFCs](https://img.shields.io/badge/RFCs-7208%20%7C%208461%20%7C%204034%20%7C%206698%20%7C%206844-blueviolet)](#standards--rfcs)
+[![GitHub last commit](https://img.shields.io/github/last-commit/alan-berger/dnstoolbox)](https://github.com/alan-berger/dnstoolbox/commits/main)
+[![GitHub issues](https://img.shields.io/github/issues/alan-berger/dnstoolbox)](https://github.com/alan-berger/dnstoolbox/issues)
+[![GitHub stars](https://img.shields.io/github/stars/alan-berger/dnstoolbox?style=social)](https://github.com/alan-berger/dnstoolbox/stargazers)
 
-![Python Version](https://img.shields.io/badge/python-%3E%3D3.8-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Checks](https://img.shields.io/badge/checks-MX%20%7C%20SPF%20%7C%20DKIM%20%7C%20DMARC%20%7C%20MTA--STS%20%7C%20DNSSEC%20%7C%20DANE%20%7C%20CAA%20%7C%20BIMI-blue)
-![Security](https://img.shields.io/badge/security-SSRF%20%2B%20XSS%20%2B%20input%20sanitisation-brightgreen)
-![Output](https://img.shields.io/badge/output-terminal%20%2B%20HTML%20report-informational)
-![Notifications](https://img.shields.io/badge/notifications-ntfy.sh-important)
-![State Tracking](https://img.shields.io/badge/state%20tracking-2--run%20regression%20detection-yellow)
+`check_dns.py` is a single-file Python tool that audits a domain's email-related DNS records and security policies, then reports each finding as **pass / warning / fail** with a one-sentence summary and actionable fix steps. It is designed to be run from the command line, on a cron schedule, or piped into a static HTML report.
 
-The tool can output directly to the terminal or produce a self-contained HTML report suitable for hosting on a website. Combined with a cron job, it provides continuous monitoring with push notifications via [ntfy](https://ntfy.sh) when a delivery-critical check degrades from green, and a recovery alert when it returns to green.
-
----
-
-## Checks Performed
-
-| Check | What is validated |
-|---|---|
-| **MX** | Mail exchange records are present and in theory the domain can receive email |
-| **SPF** | Record is present, well-formed, and within the 10 DNS lookup limit (RFC 7208) |
-| **DKIM** | Signing keys are present for the tested selectors |
-| **DMARC** | Policy is present, enforcement level, and SPF/DKIM alignment strictness |
-| **MTA-STS** | DNS record, policy file reachability, mode, max_age validity, and MX alignment |
-| **DNSSEC** | Checks if DNSSEC is enabled and DNSKEY records are published |
-| **DANE** | Checks if DANE is correctly configured, compares certificate public key hash fetched from the mailserver and DNS TLSA record hash matches |
-| **CAA** | Checks CAA record for Authorized CA(s) and Violation reporting configuration |
-| **BIMI** | DNS record, VMC presence, logo reachability, and full SVG Tiny P/S compliance |
+It checks: **MX**, **SPF**, **DKIM**, **DMARC**, **MTA-STS**, **DNSSEC**, **DANE**, **CAA**, and **BIMI**.
 
 ---
 
-## Traffic Light System
+## Features
 
-Every check is assigned one of three statuses:
+- Nine independent checks covering inbound MX, outbound authentication (SPF/DKIM/DMARC), transport security (MTA-STS, DNSSEC, DANE), certificate-issuance restrictions (CAA), and brand indicators (BIMI).
+- Three-state output (pass / warning / fail) with a colour-coded terminal view and a self-contained HTML report (no external CSS, no JavaScript, no PHP — open it directly in a browser).
+- Every non-pass result includes concrete remediation steps citing the relevant RFC and example DNS records.
+- Optional state tracking with **two-strike degradation alerting** via [ntfy](https://ntfy.sh) — alerts fire only after a problem is confirmed over two consecutive runs, eliminating false positives from transient resolver hiccups. Recovery notifications fire immediately on the first green result.
+- Optional **JSONL audit log** appending one structured record per run for long-term analysis.
+- Optional **healthchecks.io-compatible dead man's switch** to alert if the cron job itself stops running.
+- Built-in SSRF protection on URLs extracted from DNS records (BIMI logo / VMC), domain-name input validation, DNS-value sanitisation, and per-record size caps.
 
-| Colour | Meaning |
-|---|---|
-| 🟢 **Green — PASS** | Correctly configured; no action needed |
-| 🟡 **Amber — WARNING** | Present but suboptimal; security could be improved |
-| 🔴 **Red — FAIL** | Missing or critically misconfigured; immediate attention recommended |
+## Standards & RFCs
 
-Non-green results include a "How to fix" section with specific, actionable steps to resolve the issue.
+| Check    | RFC(s)                          |
+|----------|---------------------------------|
+| MX       | RFC 5321, RFC 7505 (null MX)    |
+| SPF      | RFC 7208                        |
+| DKIM     | RFC 6376                        |
+| DMARC    | RFC 7489                        |
+| MTA-STS  | RFC 8461                        |
+| DNSSEC   | RFC 4033, 4034, 4035            |
+| DANE     | RFC 6698, RFC 7672 (SMTP DANE)  |
+| CAA      | RFC 6844, RFC 8659              |
+| BIMI     | BIMI Working Group / SVG Tiny P/S |
 
----
-
-## Requirements
-
-- Python 3.8 or later
-- [`dnspython`](https://www.dnspython.org/)
-- [`requests`](https://requests.readthedocs.io/)
-
-No other third-party dependencies are required. The HTML report, notification logic, and all input validation use Python's standard library only (`ipaddress`, `urllib.parse`, `xml.etree.ElementTree`, `re`, `json`).
-
----
-
-## Installation
+## Quick start
 
 ```bash
 git clone https://github.com/alan-berger/dnstoolbox.git
 cd dnstoolbox
-pip install dnspython requests
-```
-
-Make the script executable if you intend to run it directly:
-
-```bash
-chmod +x check_dns.py
-```
-
----
-
-## Usage
-
-### Terminal output
-
-Pass the domain as an argument:
-
-```bash
+pip install -r requirements.txt
 python3 check_dns.py example.com
 ```
 
-Or run interactively and enter the domain when prompted:
+The first run will create a `check_dns_state.json` file next to the script for tracking subsequent state changes. Delete it any time to reset the baseline.
 
-```bash
-python3 check_dns.py
+## Usage
+
+```text
+check_dns.py [-h] [--html] [--dkim-selectors LIST] [--permitted-cas LIST]
+             [--state-file PATH] [--audit-log PATH]
+             [--ntfy-url URL] [--ntfy-token TOKEN]
+             [--healthcheck-url URL]
+             [domain]
 ```
 
-### HTML report
+If `domain` is omitted the script prompts for it interactively.
 
-Add the `--html` flag and redirect stdout to a file:
+### Common invocations
 
 ```bash
+# Basic terminal report
+python3 check_dns.py example.com
+
+# Self-contained HTML report
 python3 check_dns.py example.com --html > report.html
+
+# Override DKIM selectors (default tries: default, google, selector1, selector2, k1, s1, mail, dkim)
+python3 check_dns.py example.com --dkim-selectors mailer1,mailer2
+
+# Whitelist multiple CAs for CAA checking
+python3 check_dns.py example.com --permitted-cas letsencrypt.org,sectigo.com,digicert.com
+
+# Production: HTML report + ntfy alerts + audit log + dead man's switch
+python3 check_dns.py example.com --html \
+    --ntfy-url https://ntfy.sh/your-topic \
+    --audit-log /var/log/dns_audit.jsonl \
+    --healthcheck-url https://hc-ping.com/your-uuid \
+    > /var/www/html/dns-report.html
 ```
 
-The output is a fully self-contained HTML file with no external dependencies — all styling is inline CSS. It can be opened directly in a browser, served as a static file, or embedded into an existing web page.
+### Finding your DKIM selector
 
----
+The script probes a list of common selectors; if none match you'll get a `missing` result for DKIM. To find the selector your provider actually uses, inspect any delivered email — the `DKIM-Signature:` header contains an `s=` tag, e.g. `s=google` or `s=protonmail3`. Pass it via `--dkim-selectors`:
 
-## Command-Line Arguments
+```bash
+python3 check_dns.py example.com --dkim-selectors protonmail3
+```
 
-| Argument | Default | Description |
-|---|---|---|
-| `domain` | prompted | Domain name to check |
-| `--html` | off | Output a self-contained HTML report to stdout instead of terminal output |
-| `--state-file PATH` | `check_dns_state.json` | Path to the JSON state file used for regression detection. Created automatically on first run |
-| `--audit-log PATH` | none | Path to an append-only JSON lines file recording every check result on every run |
-| `--ntfy-url URL` | none | ntfy topic URL for push notifications on status changes |
-| `--healthcheck-url URL` | none | healthchecks.io-compatible ping URL, sent at the end of every successful run |
+## CLI reference
 
----
+| Flag                  | Purpose                                                                 |
+|-----------------------|-------------------------------------------------------------------------|
+| `--html`              | Emit a self-contained HTML report to stdout (no external resources).    |
+| `--dkim-selectors`    | Comma-separated list of DKIM selectors to probe (no spaces).            |
+| `--permitted-cas`     | Comma-separated list of CA domains accepted in CAA `issue` records.     |
+| `--state-file`        | Path to the JSON state file (default: `check_dns_state.json`).          |
+| `--audit-log`         | Path to an append-only JSON Lines log (one entry per run).              |
+| `--ntfy-url`          | ntfy topic URL for degradation / recovery alerts.                       |
+| `--ntfy-token`        | Bearer token for self-hosted ntfy with access control.                  |
+| `--healthcheck-url`   | URL pinged unconditionally at the end of every run (dead man's switch). |
 
-## Security Hardening
+## Output
 
-The script treats DNS record data as untrusted input throughout. This is relevant in any scenario where access to your DNS provider's console could be compromised — for example if an attacker modified your TXT records, the data returned by DNS queries would be attacker-controlled. The following defences are applied:
+### Terminal
 
-**Domain validation** — the domain argument is validated against RFC 1035/5321 rules (letters, digits, hyphens, dots; labels ≤ 63 chars; total ≤ 253 chars) before any DNS queries are made. Malformed input causes an immediate exit with a clear error message.
+Each check renders as a coloured block with status badge, one-sentence summary, raw DNS detail lines, and (when non-passing) a cyan **How to fix** section listing concrete remediation steps. A final separator and run-summary line round things off.
 
-**DNS record sanitisation** — every raw DNS record value is stripped of non-printable characters and capped at 2 KB before it enters the processing pipeline. A crafted oversized TXT record cannot bloat the HTML output.
+### HTML
 
-**HTTP response body cap** — responses from `fetch_url()` (used for the MTA-STS policy file and BIMI logo SVG) are capped at 64 KB. Servers you do not control cannot return unbounded data.
+`--html` writes a single standalone HTML document to stdout. Inline CSS, no external scripts or stylesheets, light + dark themes via `prefers-color-scheme`. The whole report is one file — copy it anywhere, serve as static content, or attach to email.
 
-**SSRF prevention** — URLs extracted from DNS records (BIMI `l=` logo URL and `a=` VMC URL) are validated before any HTTP request is made. Only HTTPS URLs with a valid public domain hostname are permitted. Blocked: non-HTTPS schemes (`http://`, `file://`, etc.), IP address literals, private/loopback/link-local ranges, and reserved hostnames such as `localhost`, `*.local`, and `*.internal`. This prevents an attacker who controls your DNS from redirecting the script to internal network endpoints or cloud metadata services.
+## Notification logic
 
-**HTML output escaping** — all DNS-derived data is passed through `html.escape()` before being written into HTML output. This is the primary XSS defence and applies to every user-visible string in the report.
+State is persisted in a JSON file keyed by domain. On each run, every delivery-critical check (everything except BIMI) is compared against its previous value:
 
-**Short tag value capping** — values extracted from DNS record tags (DMARC `p=`, MTA-STS `mode:`, etc.) are additionally capped at 64 characters when interpolated into diagnostic messages, providing defence in depth.
+- **Degradation** (green → amber/red): alert fires **only after two consecutive non-green runs** originating from a green state. This eliminates false positives from transient DNS resolution issues. Repeated alerts within the same episode are suppressed.
+- **Warn-to-fail** transitions (amber → red within an ongoing non-green episode): no new alert. The episode is already known.
+- **Recovery** (any non-green → green): alert fires immediately on the first green result.
 
-**No use of `eval`, `exec`, or unsafe deserialisers** — DNS data is used only as the subject of string operations. There is no path from DNS record content to Python code execution. The only "interpreter" that processes attacker-influenced data is `xml.etree.ElementTree`, which does not support external entity expansion (XXE) by design.
-
----
-
-## Push Notifications via ntfy
-
-The script integrates with [ntfy](https://ntfy.sh) to deliver push notifications to your phone or desktop when a delivery-critical check degrades from green, and again when it recovers.
-
-### Which checks trigger notifications
-
-Only checks that directly affect email deliverability are monitored for notifications. BIMI is intentionally excluded as it affects branding only, not delivery.
-
-| Check | Notified |
-|---|---|
-| MX Records | Yes |
-| SPF Record | Yes |
-| DKIM Record | Yes |
-| DMARC Record | Yes |
-| MTA-STS Record | Yes |
-| BIMI Record | No |
-
-### Notification rules
-
-**Degradation alert** — fires when a check moves from green to amber or red, confirmed over **2 consecutive runs**. The two-run threshold eliminates false positives caused by transient DNS timeouts or brief network hiccups. A single bad result is silently absorbed; a second consecutive bad result triggers the alert.
-
-Note that amber → red transitions do not trigger a new notification. The alert fired when the check first left green; you are already aware of the issue.
-
-**Recovery alert** — fires immediately on the first run where a previously non-green check returns to green. No threshold applies — recovery is always notified on the first confirmation.
-
-### ntfy priority mapping
-
-| Status | ntfy Priority |
-|---|---|
-| Degraded to amber | Default (3) |
-| Degraded to red | High (4) |
-| Recovered to green | Low (2) |
-
-ntfy's `Tags` header is also set per status, which renders as an emoji prefix in the notification list view in the ntfy app.
-
-Refer to the [ntfy documentation](https://docs.ntfy.sh/publish/#message-priority) for how priority levels affect notification behaviour on iOS and Android.
+If no `--ntfy-url` is given, state is still tracked but no alerts are sent.
 
 ### Setting up ntfy
 
-1. Install the ntfy app on your device ([iOS](https://apps.apple.com/app/ntfy/id1625396347) / [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy)).
-2. Choose a topic name. Because ntfy.sh topics are public and unauthenticated by default, **use a long pseudorandom string** (64 characters is recommended) rather than a memorable name. Anyone who knows your topic name can read your notifications.
-3. Subscribe to the topic in the ntfy app.
-4. Pass the full topic URL to the script:
+For the public service:
 
-```bash
-python3 check_dns.py example.com --ntfy-url https://ntfy.sh/your-64-char-random-topic
+1. Pick any unguessable topic name, e.g. `dns-check-9f3a7b2e`.
+2. Subscribe on phone or desktop at `https://ntfy.sh/dns-check-9f3a7b2e`.
+3. Pass `--ntfy-url https://ntfy.sh/dns-check-9f3a7b2e` to the script.
+
+For a self-hosted instance with access control, add `--ntfy-token <token>`.
+
+## Running on a schedule
+
+A typical cron entry (twice daily, with HTML report regeneration, alerts, audit log, and dead man's switch):
+
+```cron
+0 6,18 * * * /usr/bin/python3 /opt/dnstoolbox/check_dns.py example.com --html \
+    --ntfy-url https://ntfy.sh/your-topic \
+    --audit-log /var/log/dns_audit.jsonl \
+    --healthcheck-url https://hc-ping.com/your-uuid \
+    > /var/www/html/dns-report.html 2>> /var/log/check_dns.log
 ```
 
-ntfy is also [self-hostable](https://docs.ntfy.sh/install/) — if you run your own instance, substitute your instance URL:
+Two daily runs is the minimum cadence to make use of the two-strike alerting logic. The healthcheck ping notifies you if the cron itself silently breaks.
 
-```bash
-python3 check_dns.py example.com --ntfy-url https://ntfy.yourdomain.com/your-topic
-```
+## Requirements
 
-The script works identically with both the public instance and self-hosted deployments.
+- Python 3.9 or newer
+- `dnspython` (DNS resolution and DNSSEC support)
+- `requests` (HTTP fetches for MTA-STS policy files and BIMI logos)
+- `cryptography` (DANE certificate hashing — optional, only required for full DANE validation)
 
-### Testing ntfy independently
+All listed in `requirements.txt`.
 
-Before running the full script, verify your topic and device subscription are working with a direct curl test:
+## Architecture & security notes
 
-```bash
-curl -d "Test message from check_dns" \
-  -H "Title: DNS Checker Test" \
-  -H "Priority: 3" \
-  -H "Tags: warning" \
-  https://ntfy.sh/your-topic
-```
+The script is a single file by design — easy to read, audit, and drop into any environment. A few specifics worth knowing:
 
-If the notification arrives in the app, your topic is correctly configured.
-
----
-
-## State Tracking and Audit Logging
-
-### State file
-
-The state file (`check_dns_state.json` by default) persists the result of each delivery-critical check between runs. This is what enables regression detection — the script compares the current result against the saved state and identifies transitions.
-
-The state file is created automatically on first run. On the first run there is no prior state, so a baseline is silently established with no notifications sent — you will not be alerted about pre-existing issues on day one.
-
-Example state file:
-
-```json
-{
-  "domain": "example.com",
-  "last_run": "2026-03-20T07:13:43+00:00",
-  "checks": {
-    "dmarc": {
-      "status": "ok",
-      "consecutive_non_green": 0,
-      "episode_started_from_green": false,
-      "notified": false,
-      "last_changed": "2026-03-20T07:13:43+00:00",
-      "last_run": "2026-03-20T07:13:43+00:00"
-    }
-  }
-}
-```
-
-The state file is scoped to a single domain. If you run the script against multiple domains, use a separate `--state-file` for each.
-
-### Audit log
-
-When `--audit-log` is specified, the script appends one JSON line per run recording the timestamp, domain, and status of every check:
-
-```json
-{"timestamp": "2026-03-20T07:13:02+00:00", "domain": "example.com", "results": {"mx": "ok", "spf": "ok", "dkim": "ok", "dmarc": "ok", "mta_sts": "ok", "bimi": "warn"}}
-{"timestamp": "2026-03-20T07:13:43+00:00", "domain": "example.com", "results": {"mx": "ok", "spf": "ok", "dkim": "ok", "dmarc": "warn", "mta_sts": "ok", "bimi": "warn"}}
-```
-
-This gives you a timestamped history of your domain's posture over time. The file can be queried with `jq`:
-
-```bash
-# Show all runs where DMARC was not green
-jq 'select(.results.dmarc != "ok")' check_dns_audit.jsonl
-
-# Show the last 10 run timestamps and overall DMARC status
-jq -r '[.timestamp, .results.dmarc] | @tsv' check_dns_audit.jsonl | tail -10
-```
-
----
-
-## Dead Man's Switch via healthchecks.io
-
-The `--healthcheck-url` argument sends an unconditional HTTP GET to a [healthchecks.io](https://healthchecks.io)-compatible URL at the end of every successful run. This provides a dead man's switch — if the cron job stops executing for any reason (server down, Python error before the ping, etc.) healthchecks.io will alert you after the expected interval passes without a ping.
-
-This is complementary to ntfy notifications: ntfy tells you when DNS configuration degrades, healthchecks.io tells you when the monitoring script itself has stopped running.
-
-```bash
-python3 check_dns.py example.com --healthcheck-url https://hc-ping.com/your-uuid
-```
-
-healthchecks.io has a generous free tier and is also [self-hostable](https://healthchecks.io/docs/self_hosted/).
-
----
-
-## Automated Monitoring via Cron Job
-
-A full production cron setup combines the HTML report, ntfy notifications, audit logging, and a healthchecks.io dead man's switch in a single command.
-
-### Recommended cron entry
-
-```
-* * * * * sleep $((RANDOM % 60)) && /usr/bin/python3 /opt/dnstoolbox/check_dns.py example.com \
-  --html \
-  --ntfy-url https://ntfy.sh/your-64-char-random-topic \
-  --audit-log /opt/dnstoolbox/check_dns_audit.jsonl \
-  --healthcheck-url https://hc-ping.com/your-uuid \
-  > /var/www/html/dns-report/index.html
-```
-
-The `sleep $((RANDOM % 60))` prefix adds a random offset of 0–59 seconds before each run. This avoids the cron job firing at exactly the same second every minute, which can cause thundering herd issues if multiple monitoring scripts run simultaneously.
-
-The script exits cleanly with no interactive prompts when a domain is supplied as an argument, making it fully non-interactive and safe to run from cron.
-
-The generated HTML report includes a timestamp in the header showing when it was last produced.
-
-### Separate state and audit files per domain
-
-If monitoring multiple domains, use explicit paths to keep state isolated:
-
-```
-* * * * * sleep $((RANDOM % 60)) && /usr/bin/python3 /opt/dnstoolbox/check_dns.py example.com \
-  --html \
-  --state-file /opt/dnstoolbox/state_example.com.json \
-  --audit-log /opt/dnstoolbox/audit_example.com.jsonl \
-  --ntfy-url https://ntfy.sh/your-topic \
-  > /var/www/html/dns-report/example.com.html
-```
-
----
-
-## Check Detail
-
-### MX Records
-
-Queries the MX records for the domain. A missing result is flagged red — without MX records the domain cannot receive email and SPF/DMARC enforcement has no practical effect on inbound mail.
-
-A null MX record (`0 .`) is a valid intentional configuration for domains not used for email (RFC 7505) and is treated as present.
-
-### SPF (Sender Policy Framework)
-
-Validates that a `v=spf1` TXT record exists and counts the number of DNS-lookup-consuming mechanisms (`include:`, `a`, `mx`, `ptr`, `exists:`, `redirect=`). RFC 7208 permits a maximum of 10 such lookups per evaluation. Exceeding this limit may cause receiving servers to discard the record entirely, meaning SPF checks pass vacuously and spoofed mail goes unchallenged.
-
-If the lookup count is over 10, the result is amber with suggestions for SPF flattening.
-
-### DKIM (DomainKeys Identified Mail)
-
-Queries `<selector>._domainkey.<domain>` as a TXT record for each of the configured selectors. The default set tested is `default`, `selector1`, `selector2`.
-
-**Important:** these are only common defaults. Most mail providers use a different selector entirely. If this check returns red, it does not necessarily mean DKIM is absent — your provider's selector may simply not be in the tested list. The label in the output always reflects the actual selectors being tested, so it will update automatically if you add more.
-
-To find your actual selector, inspect the `DKIM-Signature:` header in a delivered email (available via "Show original" or "View source" in most mail clients) and look for the `s=` tag, for example `s=google` or `s=smtp`.
-
-Once identified, add your selector to the `selectors` tuple in `check_dkim()`:
-
-```python
-def check_dkim(domain, selectors=('default', 'selector1', 'selector2', 'yourSelector')):
-```
-
-### DMARC (Domain-based Message Authentication, Reporting & Conformance)
-
-Queries `_dmarc.<domain>` and evaluates:
-
-- **Policy (`p=`)** — `none` (monitoring only, red), `quarantine` (amber or green depending on alignment), `reject` (amber or green depending on alignment)
-- **SPF alignment (`aspf=`)** — `r` relaxed (default, amber) or `s` strict (green)
-- **DKIM alignment (`adkim=`)** — `r` relaxed (default, amber) or `s` strict (green)
-
-The most secure posture is `p=reject; aspf=s; adkim=s`. Strict alignment prevents subdomain spoofing by requiring the envelope sender and DKIM signing domain to exactly match the `From:` header domain rather than merely sharing the same registered domain.
-
-### MTA-STS (SMTP Mail Transfer Agent Strict Transport Security — RFC 8461)
-
-MTA-STS allows a domain to declare that inbound SMTP connections must use TLS. This prevents downgrade attacks where a malicious actor intercepts SMTP traffic and negotiates an unencrypted connection.
-
-The check validates:
-
-1. A TXT record exists at `_mta-sts.<domain>`
-2. A policy file is reachable at `https://mta-sts.<domain>/.well-known/mta-sts.txt` over HTTPS with a valid certificate
-3. The policy file contains `version: STSv1`
-4. `mode:` is `enforce` (green), `testing` (amber), or `none` (red)
-5. `max_age:` is a valid positive integer within the RFC 8461 bounds (minimum 1 day recommended, maximum ~1 year)
-6. Each `mx:` pattern in the policy file matches at least one of the domain's real DNS MX records — a mismatch in `enforce` mode is flagged red because it will cause sending MTAs to refuse delivery
-
-Wildcard MX patterns (`*.example.com`) are supported and validated correctly — they match exactly one label as specified in RFC 8461 §3.1.
-
-### BIMI (Brand Indicators for Message Identification)
-
-BIMI allows a domain to display a logo in the email client's sender avatar slot. It requires a strong DMARC policy and a correctly formatted SVG logo. BIMI does not affect email deliverability and is **excluded from push notifications**.
-
-The check validates:
-
-**DNS record** — a TXT record at `default._bimi.<domain>` is present and contains a logo URL (`l=`).
-
-**VMC (Verified Mark Certificate, `a=`)** — a VMC is issued by a Certificate Authority (currently DigiCert) and cryptographically links your logo to your domain. Gmail and Apple Mail require a VMC before they will display the logo. Yahoo Mail and Fastmail support self-asserted BIMI without a VMC. The absence of a VMC is flagged amber rather than red — the configuration is valid for a subset of providers.
-
-**Logo URL validation** — before fetching the logo, the `l=` URL is validated: only HTTPS URLs with a public domain hostname are permitted. This prevents SSRF if the DNS record is tampered with.
-
-**Logo reachability** — the SVG file at the `l=` URL is fetched and must return HTTP 200.
-
-**SVG Tiny P/S validation** — the BIMI specification requires logos to conform to the SVG Tiny Portable/Secure (P/S) profile, a restricted subset of SVG Tiny 1.2 designed to be safe for display in email clients. The following are checked:
-
-| Requirement | Detail |
-|---|---|
-| `version="1.2"` | Must be exactly `1.2` |
-| `baseProfile="tiny-ps"` | Must be exactly `tiny-ps` |
-| Square `viewBox` | Width and height must be equal (1:1 aspect ratio) |
-| `preserveAspectRatio="xMidYMid meet"` | Recommended for consistent centring |
-| `<title>` element | Must be present (brand/company name) |
-| No `x=` or `y=` on root element | Common Adobe Illustrator export artefact; must be removed |
-| No `<script>` elements | Prohibited |
-| No JS event handlers | `onclick`, `onload`, etc. are prohibited |
-| No animation elements | `<animate>`, `<animateMotion>`, `<animateTransform>`, `<set>` are prohibited |
-| No `<foreignObject>` | Prohibited |
-| No external URL references | `href`/`src` pointing to external resources are prohibited |
-| No embedded raster images | Base64 PNG/JPEG data URIs are prohibited; logos must be fully vector |
-| File size ≤ 32 KB | Recommended maximum; some validators enforce this strictly |
-| `Content-Type: image/svg+xml` | Expected MIME type from the web server |
-
-Hard failures (items that will prevent BIMI from functioning) are flagged red. Items that may cause display inconsistencies or are not strictly required are flagged amber.
-
----
-
-## DNS Caching
-
-The script creates a module-level DNS resolver with in-process caching explicitly disabled. Every query goes directly to the wire, ensuring results always reflect the current live state of your DNS records. This is particularly important when testing DNS changes with short TTLs.
-
-If you want to confirm what a specific upstream resolver currently holds for a record independently of the script, query it directly:
-
-```bash
-dig TXT _dmarc.example.com @1.1.1.1
-```
-
----
-
-## Limitations
-
-- DKIM selector detection only tests the selectors defined in `check_dkim()`. If your provider uses a different selector the check will return red even if DKIM is correctly configured. See the DKIM section above for how to identify and add your selector.
-- HTTP requests use a 10-second timeout. Slow or firewalled endpoints may be reported as unreachable.
-- DMARC `pct=` (percentage) and `fo=` (failure options) tags are not evaluated.
-- MTA-STS SMTP TLS reporting (`_smtp._tls.<domain>`) is not checked.
-- The state file tracks one domain per file. Use `--state-file` to specify separate files when monitoring multiple domains.
-- BIMI and MTA-STS logo/policy HTTP fetches are limited to 64 KB response bodies. Responses larger than this are truncated before parsing.
-
----
-
-## References
-
-- [RFC 7208](https://www.rfc-editor.org/rfc/rfc7208) — Sender Policy Framework (SPF)
-- [RFC 6376](https://www.rfc-editor.org/rfc/rfc6376) — DomainKeys Identified Mail (DKIM)
-- [RFC 7489](https://www.rfc-editor.org/rfc/rfc7489) — Domain-based Message Authentication, Reporting, and Conformance (DMARC)
-- [RFC 8461](https://www.rfc-editor.org/rfc/rfc8461) — SMTP MTA Strict Transport Security (MTA-STS)
-- [RFC 7505](https://www.rfc-editor.org/rfc/rfc7505) — A "Null MX" No Delivery Resource Record
-- [BIMI Working Group](https://bimigroup.org/) — BIMI specification and SVG logo requirements
-- [ntfy](https://ntfy.sh) — Push notification service used for alerting
-- [healthchecks.io](https://healthchecks.io) — Dead man's switch for cron job monitoring
-
----
+- **Resolver caching is disabled.** Every query goes to the wire; this matters when iterating on DNS changes with short TTLs.
+- **SSRF protection** on `BIMI l=` and `a=` URLs: only HTTPS, no IP literals, no loopback / link-local / private ranges, no `.local` / `.internal` / `.arpa`.
+- **Domain input is RFC-validated** before any DNS query runs.
+- **DNS values are sanitised** — non-printable characters stripped, length capped — before they reach the HTML output, in addition to standard HTML escaping.
+- **The HTML report is self-contained.** No external CSS, no fonts, no scripts. Safe to serve as a static file.
+- **Notification failures never abort the run.** ntfy and healthcheck errors are logged to stderr only.
 
 ## Contributing
 
-Contributions are welcome. Please open an issue or submit a pull request.
-
----
+Issues and pull requests welcome. If you're adding a check, follow the existing 4-tuple return convention (`records, status, summary, suggestions`) so it integrates with the renderers and state tracking without changes.
 
 ## License
 
-This project is open source and available under the MIT License.
+MIT — see [LICENSE](LICENSE).
