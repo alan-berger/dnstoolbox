@@ -23,6 +23,9 @@ The tool can output directly to the terminal or produce a self-contained HTML re
 | **DKIM** | Signing keys are present for the tested selectors |
 | **DMARC** | Policy is present, enforcement level, and SPF/DKIM alignment strictness |
 | **MTA-STS** | DNS record, policy file reachability, mode, max_age validity, and MX alignment |
+| **DNSSEC** | Checks if DNSSEC is enabled and DNSKEY records are published |
+| **DANE** | Checks if DANE is correctly configured, compares certificate public key hash fetched from the mailserver and DNS TLSA record hash matches |
+| **CAA** | Checks CAA record for Authorized CA(s) and Violation reporting configuration |
 | **BIMI** | DNS record, VMC presence, logo reachability, and full SVG Tiny P/S compliance |
 
 ---
