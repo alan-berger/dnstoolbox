@@ -15,6 +15,7 @@ import html as html_lib
 import ipaddress
 import json
 import re
+import smtplib
 import socket
 import ssl
 import sys
@@ -282,36 +283,181 @@ def fetch_url_full(url):
         return None, {}, str(e)
 
 
+def _certificate_to_der(cert):
+    """
+    Convert one entry from a peer certificate chain to DER bytes.
+
+    The object returned by get_unverified_chain() has varied across Python
+    versions — DER encoding constant, PEM string, or raw bytes — so each shape is
+    tried in turn rather than assuming one. Returns (der_bytes, error).
+    """
+    if isinstance(cert, bytes):
+        return cert, None
+
+    public_bytes = getattr(cert, 'public_bytes', None)
+    if public_bytes is not None:
+        for encoding in (getattr(ssl, 'ENCODING_DER', None),
+                         getattr(getattr(ssl, '_ssl', None), 'ENCODING_DER', None)):
+            if encoding is None:
+                continue
+            try:
+                return public_bytes(encoding), None
+            except Exception:
+                continue
+        try:
+            pem = public_bytes(getattr(ssl, 'ENCODING_PEM', 1))
+            if isinstance(pem, bytes):
+                pem = pem.decode('ascii', 'replace')
+            return ssl.PEM_cert_to_DER_cert(pem), None
+        except Exception as exc:
+            return None, f"could not encode a chain certificate: {exc}"
+
+    return None, f"unrecognised certificate object of type {type(cert).__name__}"
+
+
+def _peer_certificate_chain(sock):
+    """
+    Return (chain_ders, note) for the certificate chain the peer presented.
+
+    Needed for DANE-TA (usage 2) records, which pin a trust anchor somewhere in
+    the chain rather than the end-entity certificate. On failure the chain is
+    empty and 'note' explains why, so the report can say what stopped the check
+    instead of leaving the reader guessing. DANE-TA records then grade as
+    unverified rather than failed.
+
+    SSLSocket.get_unverified_chain() is public from Python 3.13. Earlier versions
+    expose the same call on the private _sslobj, which is used as a fallback
+    because the alternative is silently downgrading every DANE-TA deployment to
+    unverifiable.
+    """
+    version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+    getter = getattr(sock, 'get_unverified_chain', None)
+    source = "SSLSocket.get_unverified_chain()"
+    if getter is None:
+        sslobj = getattr(sock, '_sslobj', None)
+        getter = getattr(sslobj, 'get_unverified_chain', None)
+        source = "_sslobj.get_unverified_chain()"
+
+    if getter is None:
+        return [], (
+            f"Python {version} exposes no peer certificate chain accessor "
+            "(3.13 or later does)"
+        )
+
+    try:
+        certs = getter()
+    except Exception as exc:
+        return [], f"{source} failed on Python {version}: {exc}"
+
+    if not certs:
+        return [], f"{source} returned no certificates"
+
+    ders   = []
+    errors = []
+    for cert in certs:
+        der, error = _certificate_to_der(cert)
+        if der:
+            ders.append(der)
+        elif error:
+            errors.append(error)
+
+    if not ders:
+        return [], (
+            f"{source} returned {len(certs)} certificate(s) that could not be "
+            f"decoded on Python {version}: {errors[0] if errors else 'unknown reason'}"
+        )
+    return ders, None
+
+
 def _fetch_smtp_certificate(hostname, port=25, timeout=10):
     """
-    Connect to an SMTP server and retrieve the TLS certificate presented.
+    Connect to an SMTP server and retrieve the TLS certificate it presents.
 
     Returns (cert_der_bytes, None) on success or (None, error_str) on failure.
+
+    Uses smtplib rather than a hand-rolled dialogue. RFC 5321 requires EHLO
+    before STARTTLS — Exchange Online answers a bare STARTTLS with
+    '503 5.5.2 Send hello first' — and banners and EHLO responses are multi-line,
+    so a single recv() is not guaranteed to frame a whole response. Getting
+    either wrong produces a spurious "certificate could not be retrieved" on
+    servers that are configured correctly.
+
+    Certificate verification is deliberately disabled. DANE-EE (usage 3) pins
+    the certificate itself and is routinely used with certificates that do not
+    chain to a public root, so PKIX validation here would reject valid DANE
+    deployments. The certificate is being fetched to hash it, not to make a
+    trust decision.
     """
+    smtp = None
     try:
         context = ssl.create_default_context()
         context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        context.verify_mode    = ssl.CERT_NONE
 
-        with socket.create_connection((hostname, port), timeout=timeout) as sock:
-            # Read SMTP banner
-            sock.recv(1024)
-            # Initiate STARTTLS
-            sock.sendall(b"STARTTLS\r\n")
-            response = sock.recv(1024)
+        # The hostname must go to the constructor, not to a later connect():
+        # smtplib takes the SNI name for STARTTLS from the value stored there,
+        # and providers may serve a different certificate per SNI name.
+        smtp = smtplib.SMTP(hostname, port, timeout=timeout)
 
-            if not response.startswith(b"220"):
-                return None, f"SMTP server at {hostname}:{port} did not respond with 220 after STARTTLS"
+        code, _ = smtp.ehlo()
+        if code >= 400:
+            code, _ = smtp.helo()
+            if code >= 400:
+                return None, [], None, f"{hostname}:{port} rejected EHLO and HELO (code {code})"
 
-            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                cert_der = ssock.getpeercert(binary_form=True)
-                return cert_der, None
+        if not smtp.has_extn('starttls'):
+            return None, [], None, (
+                f"{hostname}:{port} does not advertise STARTTLS, so it cannot serve a "
+                "certificate"
+            )
+
+        smtp.starttls(context=context)
+
+        sock = getattr(smtp, 'sock', None)
+        if sock is None or not isinstance(sock, ssl.SSLSocket):
+            return None, [], None, f"{hostname}:{port} accepted STARTTLS but did not negotiate TLS"
+
+        cert_der = sock.getpeercert(binary_form=True)
+        if not cert_der:
+            return None, [], None, (
+                f"{hostname}:{port} negotiated TLS but presented no certificate"
+            )
+        chain_ders, chain_note = _peer_certificate_chain(sock)
+        return cert_der, chain_ders, chain_note, None
+
     except socket.timeout:
-        return None, f"Connection to {hostname}:{port} timed out"
-    except socket.gaierror as e:
-        return None, f"Failed to resolve hostname {hostname}: {e}"
-    except Exception as e:
-        return None, f"Error fetching certificate from {hostname}:{port}: {e}"
+        return None, [], None, (
+            f"connection to {hostname}:{port} timed out after {timeout}s — many "
+            "networks and cloud providers block outbound port 25"
+        )
+    except socket.gaierror as exc:
+        return None, [], None, f"failed to resolve {hostname}: {exc}"
+    except ssl.SSLError as exc:
+        return None, [], None, f"TLS handshake with {hostname}:{port} failed: {exc}"
+    except smtplib.SMTPResponseException as exc:
+        detail = exc.smtp_error
+        if isinstance(detail, bytes):
+            detail = detail.decode('utf-8', 'replace')
+        return None, [], None, (
+            f"{hostname}:{port} refused STARTTLS (code {exc.smtp_code}: "
+            f"{str(detail)[:120]})"
+        )
+    except smtplib.SMTPException as exc:
+        return None, [], None, f"SMTP error talking to {hostname}:{port}: {exc}"
+    except OSError as exc:
+        return None, [], None, (
+            f"could not connect to {hostname}:{port}: {exc} — outbound port 25 may be "
+            "blocked on this host"
+        )
+    except Exception as exc:
+        return None, [], None, f"error fetching certificate from {hostname}:{port}: {exc}"
+    finally:
+        if smtp is not None:
+            try:
+                smtp.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -976,209 +1122,1048 @@ def check_dnssec(domain):
 
 
 # ---------------------------------------------------------------------------
-# DANE (RFC 6698)
+# DANE (RFC 6698, RFC 7672)
+#
+# Two facts drive the design of this section:
+#
+#   1. A TLSA record lives in the zone of the MX *hostname*, not in the zone of
+#      the mail domain. When inbound mail is handled by a hosted provider
+#      (Microsoft 365, Google Workspace, a filtering gateway) the domain owner
+#      cannot publish that record at all, so generic "add a TLSA record" advice
+#      is wrong and unactionable.
+#
+#   2. DANE applies per MX host, not per domain (RFC 7672 §2.2). A sender may
+#      select any MX; if the one it picks has no TLSA record, it falls back to
+#      opportunistic TLS for that delivery. Partial coverage therefore protects
+#      nothing reliably, so every MX host is checked, not just the primary.
+#
+# The provider table supplies names and vendor-specific procedures only.
+# Whether DANE is *possible* is decided at runtime from evidence: the zone cut
+# containing each MX host is located and probed for DNSKEY. A stale table
+# therefore degrades to correct-but-generic guidance rather than to confidently
+# wrong instructions.
 # ---------------------------------------------------------------------------
 
-def check_dane(domain, mx_hostname=None):
+# 'inbound_dane' values — what, if anything, the domain owner can do:
+#
+#   'customer'  — the provider offers inbound DANE and a customer action turns
+#                 it on. Graded FAIL when absent: it is actionable.
+#   'migration' — the provider offers it, but only on a different MX endpoint;
+#                 the fix is to move. Graded FAIL: also actionable.
+#   'provider'  — the provider publishes TLSA records itself and there is
+#                 nothing to configure. Absence is anomalous rather than a
+#                 misconfiguration of this domain.
+#   'no'        — the provider does not offer inbound DANE; no action exists.
+#   'unknown'   — not established. The runtime DNSSEC probe decides, and the
+#                 output stays accurate as vendors change their offerings.
+#
+# Only 'customer', 'migration', 'provider' and 'no' make a claim about a
+# vendor. Entries marked 'unknown' are present purely so the report can name
+# the provider — that is useful on its own and cannot go stale.
+#
+# Guidance strings are formatted with {domain}, {mx} and {apex}.
+_MAIL_PROVIDERS = (
+    {
+        'name': 'Microsoft 365 / Exchange Online (DNSSEC-enabled endpoint)',
+        'suffixes': ('mx.microsoft',),
+        'inbound_dane': 'customer',
+        'guidance': [
+            "This MX is already on Microsoft's DNSSEC-signed mail-flow endpoint, but "
+            "inbound SMTP DANE has not been switched on for the domain. TLSA records "
+            "here are published and rotated by Microsoft, not by you.",
+            "In Exchange Online PowerShell run: Enable-SmtpDaneInbound -DomainName {domain}",
+            "Allow 15-30 minutes for the TLSA records to publish, then verify with: "
+            "dig TLSA _25._tcp.{mx}",
+            "Exchange Online publishes several TLSA records per host and expects some "
+            "of them not to match the certificate currently served; one match is "
+            "sufficient.",
+        ],
+    },
+    {
+        'name': 'Microsoft 365 / Exchange Online',
+        'suffixes': (
+            'mail.protection.outlook.com',
+            'mail.eo.outlook.com',
+            'olc.protection.outlook.com',
+        ),
+        'inbound_dane': 'migration',
+        'guidance': [
+            "You cannot publish a TLSA record for this MX host. Its zone is operated by "
+            "Microsoft and is not DNSSEC-signed, so DANE cannot be validated against it "
+            "regardless of what you publish in {domain}.",
+            "Microsoft offers inbound SMTP DANE only on its newer DNSSEC-signed endpoint "
+            "under mx.microsoft. Migrating is the correct fix, in this order:",
+            "1. Sign the {domain} zone with DNSSEC and publish the DS record at your "
+            "registrar. Microsoft will not enable DANE until your own chain of trust is "
+            "intact.",
+            "2. Lower the TTL on the existing MX record (not below 30 seconds) and wait "
+            "for the old TTL to expire.",
+            "3. In Exchange Online PowerShell run: "
+            "Enable-DnssecForVerifiedDomain -DomainName {domain} — this returns a "
+            "DnssecMxValue such as example-com.o-v1.mx.microsoft (the middle label is "
+            "tenant-specific and is not predictable).",
+            "4. Add that value as an additional MX at a higher preference number (lower "
+            "priority), test inbound delivery, then promote it to preference 0 and "
+            "remove the old {mx} record.",
+            "5. Run: Enable-SmtpDaneInbound -DomainName {domain}. Microsoft then "
+            "publishes and rotates the TLSA records for you.",
+            "Microsoft's documentation assumes a single MX at preference 0 or 10 with no "
+            "fallback MX. If you keep a secondary MX, mail delivered to it is not "
+            "DANE-protected.",
+            "From 1 July 2026 Microsoft provisions new accepted domains under "
+            "*.mx.microsoft automatically; existing domains still require the migration "
+            "above.",
+            "onmicrosoft.com tenant domains and self-service sign-up domains are not "
+            "supported for inbound SMTP DANE.",
+            "If a filtering gateway (Mimecast, Proofpoint, Barracuda and similar) sits in "
+            "front of Exchange Online, the last SMTP hop is theirs, not Microsoft's — "
+            "DANE then depends entirely on that vendor.",
+            "Until the migration is done, MTA-STS is the transport-security control you "
+            "can deploy yourself for this domain.",
+        ],
+    },
+    {
+        'name': 'Google Workspace / Gmail',
+        'suffixes': (
+            'aspmx.l.google.com',
+            'l.google.com',
+            'googlemail.com',
+            'smtp.google.com',
+        ),
+        'inbound_dane': 'no',
+        'guidance': [
+            "You cannot publish a TLSA record for this MX host — the zone belongs to "
+            "Google, and a TLSA record placed in the {domain} zone has no effect.",
+            "Google validates DANE on mail it sends, but does not publish TLSA records "
+            "for inbound Workspace mail and does not sign these zones with DNSSEC. "
+            "There is no tenant setting that changes this, so no action is available to "
+            "you here.",
+            "Deploy MTA-STS in enforce mode and TLS-RPT instead — both are published in "
+            "your own zone, are supported by Google, and give you downgrade protection "
+            "plus failure reporting.",
+        ],
+    },
+    {
+        # Proton publishes TLSA records on its MX hosts and states that this
+        # covers the custom domains it hosts. Verified by observation of
+        # _25._tcp.mail.protonmail.ch.
+        'name': 'Proton Mail',
+        'suffixes': ('protonmail.ch', 'protonmail.com', 'proton.me'),
+        'inbound_dane': 'provider',
+        'guidance': [
+            "Proton publishes and rotates the TLSA records for its own MX hosts, which "
+            "covers the custom domains it hosts. There is nothing to configure in the "
+            "{domain} zone.",
+            "No TLSA record was found for this host, which is unexpected. Confirm the MX "
+            "hostname is correct and current before raising it with Proton.",
+            "Signing the {domain} zone with DNSSEC is still worthwhile: it protects the "
+            "MX lookup itself, without which a sender cannot trust which host to apply "
+            "DANE to.",
+        ],
+    },
+    {
+        # Reported to publish TLSA records; not independently verified here, so
+        # the wording below stays hedged.
+        'name': 'Fastmail',
+        'suffixes': ('messagingengine.com',),
+        'inbound_dane': 'provider',
+        'guidance': [
+            "Fastmail is understood to publish TLSA records for its inbound MX hosts, so "
+            "there is normally nothing to configure in the {domain} zone.",
+            "No TLSA record was found for this host. Confirm the MX hostname matches "
+            "Fastmail's current documentation — regional MX hosts differ — and check "
+            "with them if it does.",
+            "Signing the {domain} zone with DNSSEC is still worthwhile: it protects the "
+            "MX lookup itself.",
+        ],
+    },
+    # The entries below exist so the report can name the provider. Their
+    # inbound-DANE posture is not asserted; the runtime DNSSEC probe decides.
+    {
+        'name': 'Proofpoint',
+        'suffixes': ('pphosted.com', 'ppe-hosted.com', 'proofpoint.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Mimecast',
+        'suffixes': ('mimecast.com', 'mimecast.co.za', 'mimecast-offshore.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Barracuda Email Security Service',
+        'suffixes': ('barracudanetworks.com', 'barracuda.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Cisco Secure Email (IronPort)',
+        'suffixes': ('iphmx.com', 'cisco.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Zoho Mail',
+        'suffixes': ('zoho.com', 'zoho.eu', 'zoho.in', 'zohomail.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Amazon SES / WorkMail',
+        'suffixes': ('amazonaws.com', 'awsapps.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Cloudflare Email Routing',
+        'suffixes': ('mx.cloudflare.net',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Apple iCloud Mail',
+        'suffixes': ('mail.icloud.com', 'icloud.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'mailbox.org',
+        'suffixes': ('mailbox.org',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Posteo',
+        'suffixes': ('posteo.de',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Migadu',
+        'suffixes': ('migadu.com',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Tuta (Tutanota)',
+        'suffixes': ('tutanota.de', 'tuta.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Rackspace Email',
+        'suffixes': ('emailsrvr.com',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'GoDaddy / Secureserver',
+        'suffixes': ('secureserver.net',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Namecheap Private Email',
+        'suffixes': ('privateemail.com',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Titan Mail',
+        'suffixes': ('titan.email',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'Hostinger Email',
+        'suffixes': ('hostinger.com',),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'OVHcloud',
+        'suffixes': ('ovh.net', 'ovh.ca'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+    {
+        'name': 'IONOS',
+        'suffixes': ('ionos.com', 'ionos.de', 'kundenserver.de', 'ui-dns.com'),
+        'inbound_dane': 'unknown',
+        'guidance': [],
+    },
+)
+
+# MX endpoints that still route mail but are superseded — flagged separately
+# because they usually indicate a stale DNS zone rather than a deliberate choice.
+_LEGACY_MX_SUFFIXES = {
+    'mail.eo.outlook.com': (
+        "legacy Exchange Online (FOPE-era) endpoint. Microsoft has recommended the "
+        "current *.mail.protection.outlook.com endpoint for years, and this one is a "
+        "dead end for DANE."
+    ),
+}
+
+# Worst-first ordering used when reducing per-host statuses to one overall status.
+_STATUS_SEVERITY = {'missing': 2, 'warn': 1, 'ok': 0}
+
+
+def _match_mail_provider(mx_hostname):
+    """Return (provider_dict, matched_suffix), or (None, None) if unrecognised."""
+    host = mx_hostname.rstrip('.').lower()
+    for provider in _MAIL_PROVIDERS:
+        for suffix in provider['suffixes']:
+            if host == suffix or host.endswith('.' + suffix):
+                return provider, suffix
+    return None, None
+
+
+def _mx_is_self_hosted(domain, mx_hostname):
     """
-    Check DANE configuration for the domain's mail server.
+    True when the MX hostname sits inside the checked domain's own namespace,
+    i.e. the operator plausibly controls the zone the TLSA record must live in.
 
-    Verifies:
-    1. TLSA record exists at _25._tcp.<mx_hostname>
-    2. Certificate retrieved from the mail server matches the TLSA record hash
-
-    Note: DANE requires DNSSEC to provide security; the DNSSEC check is run
-    separately by this script. If mx_hostname is not provided, the domain's
-    MX records are queried to discover it.
+    Deliberately conservative: an MX under a different domain you also own
+    (example.com -> mail.example.net) is reported as third-party. That case is
+    handled by the --dane-self-hosted override rather than by guessing.
     """
-    results = []
+    host   = mx_hostname.rstrip('.').lower()
+    domain = domain.rstrip('.').lower()
+    return host == domain or host.endswith('.' + domain)
 
-    # Get MX record if not provided
-    if not mx_hostname:
-        mx_records = get_dns_records(domain, 'MX')
-        if not mx_records:
+
+def _zone_apex(name):
+    """
+    Return the apex of the zone that actually contains 'name', or None if it
+    cannot be determined.
+
+    Queries SOA for the name itself: an authoritative NODATA response carries the
+    containing zone's SOA in the authority section. This is more accurate than
+    walking labels upward, which would find the signed TLD above an unsigned
+    provider zone and report a false positive.
+    """
+    try:
+        answer = _resolver.resolve(name, 'SOA', raise_on_no_answer=False)
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers,
+            dns.resolver.NoAnswer, dns.exception.Timeout):
+        return None
+
+    if answer.rrset is not None:
+        return answer.rrset.name.to_text().rstrip('.').lower()
+    for rrset in answer.response.authority:
+        if rrset.rdtype == dns.rdatatype.SOA:
+            return rrset.name.to_text().rstrip('.').lower()
+    return None
+
+
+def _zone_is_dnssec_signed(zone):
+    """
+    True / False / None (undetermined) for whether 'zone' publishes DNSKEY.
+
+    Structural check only, matching check_dnssec(): it does not validate the
+    chain of trust to the root. None is returned on transport failures so a
+    timeout is never reported as 'unsigned'.
+    """
+    try:
+        answer = _resolver.resolve(zone, 'DNSKEY', raise_on_no_answer=False)
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        return False
+    except (dns.resolver.NoNameservers, dns.exception.Timeout):
+        return None
+    return answer.rrset is not None and len(answer.rrset) > 0
+
+
+def _sorted_mx_hosts(domain):
+    """
+    Return (preference, hostname) pairs ordered by preference, lowest first.
+
+    get_dns_records() returns 'preference hostname' strings in resolver order,
+    which is not preference order.
+    """
+    parsed = []
+    for record in get_dns_records(domain, 'MX'):
+        parts = record.split()
+        if len(parts) < 2:
+            continue
+        try:
+            preference = int(parts[0])
+        except ValueError:
+            continue
+        host = parts[1].rstrip('.').lower()
+        if host and host != '.':          # null MX (RFC 7505) has no host
+            parsed.append((preference, host))
+    parsed.sort(key=lambda item: (item[0], item[1]))
+    return parsed
+
+
+def _format_guidance(lines, domain, mx_hostname, apex):
+    return [
+        line.format(domain=domain, mx=mx_hostname, apex=apex or 'the MX hostname')
+        for line in lines
+    ]
+
+
+def _dedupe(items):
+    """Remove duplicates while preserving first-seen order."""
+    seen = set()
+    out  = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# TLSA record handling
+# ---------------------------------------------------------------------------
+
+_TLSA_USAGE_MAP    = {'0': 'PKIX-TA', '1': 'PKIX-EE', '2': 'DANE-TA', '3': 'DANE-EE'}
+_TLSA_SELECTOR_MAP = {'0': 'Full Cert', '1': 'Public Key'}
+_TLSA_TYPE_MAP     = {'1': 'SHA-256', '2': 'SHA-512'}
+
+
+def _parse_tlsa_record(record):
+    """
+    Parse one TLSA record into (usage, selector, matching_type, hash, error).
+
+    dnspython renders the certificate association data with embedded whitespace
+    for long hashes, so everything from field four onward is joined and stripped
+    rather than taking a single token.
+    """
+    parts = record.split()
+    if len(parts) < 4:
+        return None, None, None, None, f"malformed TLSA record: {record}"
+
+    usage, selector, matching_type = parts[0], parts[1], parts[2]
+    tlsa_hash = ''.join(parts[3:]).lower()
+
+    if usage not in _TLSA_USAGE_MAP:
+        return None, None, None, None, (
+            f"invalid usage field '{usage}' (expected 0-3; RFC 7672 recommends 3, DANE-EE)"
+        )
+    if selector not in _TLSA_SELECTOR_MAP:
+        return None, None, None, None, (
+            f"invalid selector field '{selector}' (expected 0 or 1; 1 is recommended)"
+        )
+    if matching_type not in _TLSA_TYPE_MAP:
+        return None, None, None, None, (
+            f"invalid matching-type field '{matching_type}' (expected 1 or 2; "
+            "1 is SHA-256)"
+        )
+    return usage, selector, matching_type, tlsa_hash, None
+
+
+def _cert_association_hash(cert_der, selector, matching_type):
+    """
+    Compute the certificate association data a TLSA record should contain for
+    this certificate, for the given selector and matching type.
+
+    Returns (hex_digest, error). Import errors are surfaced to the caller rather
+    than raised so the check can degrade to a warning.
+    """
+    try:
+        import hashlib
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
+    except ImportError:
+        return None, "the 'cryptography' library is not installed"
+
+    try:
+        cert_obj = x509.load_der_x509_certificate(cert_der, default_backend())
+        if selector == '1':
+            data = cert_obj.public_key().public_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        else:
+            data = cert_der
+
+        if matching_type == '1':
+            return hashlib.sha256(data).hexdigest(), None
+        if matching_type == '2':
+            return hashlib.sha512(data).hexdigest(), None
+        return None, f"unsupported matching type '{matching_type}'"
+    except Exception as exc:
+        return None, f"hash computation failed: {str(exc)[:80]}"
+
+
+def _validate_tlsa_set(host, tlsa_records, cert_der, chain_ders, chain_note=None):
+    """
+    Validate every TLSA record at a host against what the server presented.
+
+    Three rules from RFC 7671/7672 drive this, and getting any of them wrong
+    produces false failures on correctly configured hosts:
+
+      - A host's TLSA records are a set of alternatives. The connection is
+        authenticated if ANY usable record matches (RFC 7672 §2.2), so providers
+        that rotate keys publish several and expect some not to match.
+
+      - Usage 3 (DANE-EE) pins the end-entity certificate; usage 2 (DANE-TA)
+        pins a trust anchor somewhere in the presented chain. Comparing a
+        DANE-TA record against the leaf certificate is simply the wrong
+        comparison and will never match.
+
+      - Usage 0 (PKIX-TA) and 1 (PKIX-EE) MUST be ignored by SMTP clients
+        (RFC 7672 §3.1.3), so they are reported and excluded rather than tested.
+
+    Returns (status, lines, suggestions, reason).
+    """
+    lines       = []
+    suggestions = []
+    matched     = 0
+    comparable  = 0
+    unverified  = 0
+    ignored     = 0
+
+    for record in tlsa_records:
+        usage, selector, matching_type, tlsa_hash, error = _parse_tlsa_record(record)
+        if error:
+            lines.append(f"TLSA: {error}")
+            continue
+
+        descriptor = (
+            f"usage={_TLSA_USAGE_MAP[usage]}, "
+            f"selector={_TLSA_SELECTOR_MAP[selector]}, "
+            f"type={_TLSA_TYPE_MAP[matching_type]}"
+        )
+
+        # PKIX-TA / PKIX-EE: not usable for SMTP.
+        if usage in ('0', '1'):
+            ignored += 1
+            lines.append(
+                f"TLSA [{descriptor}]: ignored — RFC 7672 requires SMTP clients to "
+                "disregard PKIX-TA and PKIX-EE records"
+            )
+            continue
+
+        # DANE-TA: the anchor may be any certificate in the presented chain.
+        if usage == '2':
+            if not chain_ders:
+                unverified += 1
+                lines.append(
+                    f"TLSA [{descriptor}]: trust-anchor record, not verified — "
+                    + (chain_note or "the certificate chain could not be read")
+                )
+                continue
+            comparable += 1
+            hit = False
+            for candidate in chain_ders:
+                computed, comp_error = _cert_association_hash(
+                    candidate, selector, matching_type)
+                if comp_error:
+                    continue
+                if computed == tlsa_hash:
+                    hit = True
+                    break
+            if hit:
+                matched += 1
+                lines.append(
+                    f"TLSA [{descriptor}]: matches a certificate in the served chain"
+                )
+            else:
+                lines.append(
+                    f"TLSA [{descriptor}]: no certificate in the served chain "
+                    f"({len(chain_ders)} presented) matches"
+                )
+            continue
+
+        # DANE-EE: pins the end-entity certificate.
+        computed, comp_error = _cert_association_hash(cert_der, selector, matching_type)
+        if comp_error:
+            unverified += 1
+            lines.append(f"TLSA [{descriptor}]: could not verify — {comp_error}")
+            continue
+
+        comparable += 1
+        if computed == tlsa_hash:
+            matched += 1
+            lines.append(f"TLSA [{descriptor}]: matches the served certificate")
+        else:
+            lines.append(
+                f"TLSA [{descriptor}]: does not match (DNS {tlsa_hash[:16]}…, "
+                f"cert {computed[:16]}…)"
+            )
+
+    total_notes = []
+    if ignored:
+        total_notes.append(f"{ignored} ignored as PKIX")
+    if unverified:
+        total_notes.append(f"{unverified} not verifiable")
+    suffix = f" ({', '.join(total_notes)})" if total_notes else ""
+
+    if matched:
+        lines.append(
+            f"{matched} of {comparable} verifiable TLSA record(s) match{suffix} — "
+            "one match is sufficient"
+        )
+        return 'ok', lines, suggestions, "DANE valid"
+
+    if unverified and not comparable:
+        suggestions.append(
+            "This host publishes only trust-anchor (DANE-TA) records and the "
+            "certificate chain could not be read, so the pinning could not be "
+            "confirmed. Python 3.13 or later exposes the chain directly; on older "
+            "versions verify manually: openssl s_client -showcerts -connect "
+            f"{host}:25 -starttls smtp"
+        )
+        return ('warn', lines, suggestions,
+                "TLSA published but could not be verified from this connection")
+
+    if not comparable:
+        return ('missing', lines, [
+            "No TLSA record at this host is usable for SMTP. RFC 7672 requires usage 2 "
+            "(DANE-TA) or usage 3 (DANE-EE); usage 0 and 1 records are ignored by "
+            "sending servers.",
+            "Republish as usage 3 with selector 1 and matching type 1 (3 1 1), which is "
+            "the recommended combination for SMTP.",
+        ], "no TLSA record usable for SMTP")
+
+    suggestions.append(
+        f"None of the {comparable} verifiable TLSA record(s) at this host match what it "
+        f"is serving{suffix}, so every DANE-enforcing sender will refuse delivery."
+    )
+    suggestions.append(
+        f"If the certificate was renewed, republish the TLSA record: "
+        f"echo | openssl s_client -connect {host}:25 -starttls smtp 2>/dev/null | "
+        "openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | "
+        "openssl dgst -sha256 -hex | cut -d' ' -f2"
+    )
+    suggestions.append(
+        "Publish the new record alongside the old one before the certificate changes, "
+        "and remove the old one only after the TTL has expired — that is the rotation "
+        "order that avoids an outage."
+    )
+    return ('missing', lines, suggestions,
+            "TLSA records do not match what the server presents")
+
+
+# ---------------------------------------------------------------------------
+# Per-host evaluation
+# ---------------------------------------------------------------------------
+
+def _dane_self_hosted_absent(domain, host, apex, apex_signed):
+    """Remediation for an MX with no TLSA record, in a zone the operator controls."""
+    tlsa_name   = f"_25._tcp.{host}"
+    suggestions = [
+        f"Add a TLSA record at {tlsa_name} with format:",
+        f"_25._tcp.{host}.  3600  IN  TLSA  3 1 1 <sha256-hash>",
+        "The hash is the SHA-256 of the mail server's public key (TLSA 3 1 1).",
+        f"Generate the hash: echo | openssl s_client -connect {host}:25 "
+        "-starttls smtp 2>/dev/null | openssl x509 -pubkey -noout | openssl pkey "
+        "-pubin -outform DER | openssl dgst -sha256 -hex | cut -d' ' -f2",
+        f"Once published, verify with: dig TLSA {tlsa_name}",
+    ]
+
+    if apex_signed is False:
+        suggestions.insert(
+            0,
+            f"Sign the {apex} zone with DNSSEC first and publish its DS record at the "
+            "parent. TLSA records in an unsigned zone are unauthenticated and are "
+            "ignored by every validating sender, so DANE would have no effect.",
+        )
+    elif apex_signed is None:
+        suggestions.append(
+            f"DNSSEC status of the {apex or 'MX'} zone could not be determined on this "
+            "run; confirm it is signed, as DANE provides no security without it."
+        )
+    else:
+        suggestions.append(
+            f"DANE requires DNSSEC on the zone holding the TLSA record — {apex} appears "
+            "to be signed, so publishing the TLSA record is sufficient."
+        )
+
+    return 'missing', "no TLSA record published", suggestions
+
+
+def _dane_third_party_absent(domain, host, provider, apex, apex_signed,
+                             third_party_status):
+    """
+    Remediation for an MX with no TLSA record, in a zone the operator does not
+    control.
+
+    The status choice is deliberate: a missing TLSA record on a provider that
+    does not offer DANE is not a misconfiguration of this domain and there is no
+    action the operator can take, so it defaults to WARNING rather than FAIL.
+    Where the provider does offer DANE and it has simply not been enabled, that
+    is actionable and stays FAIL.
+    """
+    provider_name = provider['name'] if provider else None
+    inbound       = provider['inbound_dane'] if provider else 'unknown'
+    apex_label    = apex or 'the MX hostname'
+
+    if provider and provider['guidance']:
+        suggestions = _format_guidance(provider['guidance'], domain, host, apex)
+    else:
+        suggestions = [
+            f"You do not control the {apex_label} zone, so there is nothing to publish "
+            f"in {domain}. DANE is validated against TLSA records at the MX hostname, "
+            "not at the mail domain.",
+            f"Ask {provider_name or 'your mail provider'} whether they publish "
+            "DNSSEC-signed TLSA records for inbound MX hosts, or whether they offer a "
+            "DANE-capable endpoint you can migrate your MX to.",
+            "Deploy MTA-STS in enforce mode and TLS-RPT in the meantime — both live in "
+            "your own zone and give you downgrade protection you control.",
+            f"If you do in fact operate {apex_label}, re-run with --dane-self-hosted to "
+            "get TLSA publication steps instead.",
+        ]
+
+    if inbound == 'customer':
+        return 'missing', "DANE supported by the provider but not enabled", suggestions
+    if inbound == 'migration':
+        return 'missing', "endpoint cannot support DANE; provider offers a migration path", suggestions
+    if inbound == 'provider':
+        return third_party_status, "provider normally publishes TLSA; none found", suggestions
+    if inbound == 'no':
+        return third_party_status, "provider does not offer inbound DANE", suggestions
+    return third_party_status, "MX operated by a third party; DANE not available", suggestions
+
+
+def _check_mx_host(domain, host, third_party_status, assume_self_hosted):
+    """
+    Evaluate DANE for a single MX host.
+
+    Returns a dict with: host, status, has_tlsa, lines, suggestions, reason,
+    provider_name, apex, apex_signed.
+    """
+    provider, _ = _match_mail_provider(host)
+    apex        = _zone_apex(host)
+    apex_signed = _zone_is_dnssec_signed(apex) if apex else None
+    self_hosted = assume_self_hosted or _mx_is_self_hosted(domain, host)
+
+    apex_label = apex or 'unknown zone'
+    if apex_signed is True:
+        zone_line = f"zone {apex_label}: DNSSEC-signed"
+    elif apex_signed is False:
+        zone_line = f"zone {apex_label}: NOT DNSSEC-signed"
+    else:
+        zone_line = f"zone {apex_label}: DNSSEC status undetermined"
+
+    notes = [
+        f"note: this is a {note}"
+        for suffix, note in _LEGACY_MX_SUFFIXES.items()
+        if host == suffix or host.endswith('.' + suffix)
+    ]
+
+    # Line fields are kept separate rather than pre-joined so that hosts with
+    # identical findings — the five Google MX hosts, for example — can be
+    # collapsed into one block at render time.
+    info = {
+        'host':          host,
+        'provider_name': provider['name'] if provider else None,
+        'apex':          apex,
+        'apex_signed':   apex_signed,
+        'self_hosted':   self_hosted,
+        'zone_line':     zone_line,
+        'scope_line':    None,
+        'notes':         notes,
+        'detail_lines':  [],
+        'suggestions':   [],
+    }
+
+    tlsa_records     = get_dns_records(f"_25._tcp.{host}", 'TLSA')
+    info['has_tlsa'] = bool(tlsa_records)
+
+    # ---- No TLSA record ----------------------------------------------------
+    if not tlsa_records:
+        info['tlsa_line'] = "no TLSA record at _25._tcp.<host>"
+        if self_hosted:
+            status, reason, suggestions = _dane_self_hosted_absent(
+                domain, host, apex, apex_signed)
+        else:
+            info['scope_line'] = (
+                f"MX host is outside the {domain} zone"
+                + (f" ({info['provider_name']})" if info['provider_name'] else "")
+            )
+            status, reason, suggestions = _dane_third_party_absent(
+                domain, host, provider, apex, apex_signed, third_party_status)
+        info.update(status=status, reason=reason, suggestions=suggestions)
+        return info
+
+    # ---- TLSA present: validate against the served certificate -------------
+    info['tlsa_line'] = f"{len(tlsa_records)} TLSA record(s) at _25._tcp.<host>"
+
+    cert_der, chain_ders, chain_note, cert_error = _fetch_smtp_certificate(
+        host, port=25, timeout=10)
+    if cert_der is None:
+        info.update(
+            status='warn',
+            reason="TLSA published but the certificate could not be retrieved",
+            suggestions=[
+                f"Verify connectivity to {host}:25 — check firewall rules and SMTP "
+                "service status.",
+                f"Test manually: openssl s_client -connect {host}:25 -starttls smtp",
+                "Until the certificate can be fetched, this script cannot confirm the "
+                "TLSA record still matches.",
+            ],
+        )
+        info['detail_lines'].append(f"certificate fetch failed: {cert_error}")
+        return info
+
+    status, lines, suggestions, reason = _validate_tlsa_set(
+        host, tlsa_records, cert_der, chain_ders, chain_note)
+    info['detail_lines'].extend(lines)
+    info['reason'] = reason
+
+    # A matching TLSA record in an unsigned zone is decorative: senders cannot
+    # authenticate it, so it must not be graded as a pass.
+    if status == 'ok' and apex_signed is False:
+        status = 'warn'
+        suggestions = [
+            f"The TLSA record matches the served certificate, but {apex_label} is not "
+            "DNSSEC-signed, so validating senders discard it and DANE provides no "
+            "protection.",
+            f"Sign {apex_label} and publish its DS record at the parent, then verify "
+            f"with: dig +dnssec TLSA _25._tcp.{host} — the response should carry the "
+            "'ad' flag.",
+        ] + suggestions
+        info['reason'] = "TLSA matches but the zone is unsigned"
+
+    info.update(status=status, suggestions=suggestions)
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Aggregation across MX hosts
+# ---------------------------------------------------------------------------
+
+def _group_host_infos(host_infos):
+    """
+    Collapse MX hosts whose findings are identical into one reporting group.
+
+    Google Workspace publishes five MX hosts in one zone with one posture;
+    printing five identical blocks buries the finding. Hosts are grouped only
+    when nothing that matters differs, so no detail is lost — hosts that do have
+    TLSA records are never grouped, since their certificates differ.
+    """
+    groups = []
+    for info in host_infos:
+        key = (
+            info['has_tlsa'],
+            info['status'],
+            info['reason'],
+            info['provider_name'],
+            info['apex'],
+            info['apex_signed'],
+            info['scope_line'],
+            tuple(info['notes']),
+        )
+        if not info['has_tlsa'] and groups and groups[-1]['key'] == key:
+            groups[-1]['hosts'].append(info['host'])
+        else:
+            groups.append({'key': key, 'hosts': [info['host']], 'info': info})
+    return groups
+
+
+def _render_group(group, first_index, total):
+    """Render one reporting group as a header line plus indented detail lines."""
+    info  = group['info']
+    hosts = group['hosts']
+
+    if len(hosts) == 1:
+        position = f"MX {first_index}/{total}"
+        subject  = hosts[0]
+    else:
+        position = f"MX {first_index}-{first_index + len(hosts) - 1}/{total}"
+        subject  = ", ".join(hosts)
+
+    header = f"{position}: {subject}"
+    if info['provider_name']:
+        header += f" [{info['provider_name']}]"
+    header += f" — {_STATUS_LABEL[info['status']]}: {info['reason']}"
+
+    if len(hosts) == 1:
+        tlsa_line  = info['tlsa_line'].replace('<host>', hosts[0])
+        scope_line = info['scope_line']
+    else:
+        # Name a real host rather than a placeholder, then say the finding holds
+        # for the rest — the reader can verify the claim with dig as written.
+        tlsa_line = (
+            info['tlsa_line'].replace('<host>', hosts[0])
+            + f" (same for the other {len(hosts) - 1} host"
+            + ("s)" if len(hosts) > 2 else ")")
+        )
+        scope_line = (info['scope_line'] or '').replace(
+            'MX host is outside', 'MX hosts are outside') or None
+
+    lines = [tlsa_line]
+    if scope_line:
+        lines.append(scope_line)
+    lines.append(info['zone_line'])
+    lines.extend(info['notes'])
+    lines.extend(info['detail_lines'])
+    return header, lines
+
+
+def _aggregate_dane(domain, host_infos, skipped_hosts):
+    """
+    Reduce per-host results to the (records, status, summary, suggestions)
+    contract used by every other check.
+
+    Overall status is the worst per-host status: a sender is free to choose any
+    MX, so the weakest host defines what the domain actually guarantees.
+    """
+    records     = []
+    suggestions = []
+    total       = len(host_infos)
+    position    = 1
+
+    for group in _group_host_infos(host_infos):
+        header, lines = _render_group(group, position, total)
+        records.append(header)
+        records.extend(f"  {line}" for line in lines)
+        suggestions.extend(group['info']['suggestions'])
+        position += len(group['hosts'])
+
+    if skipped_hosts:
+        records.append(
+            f"{len(skipped_hosts)} further MX host(s) not checked "
+            f"(--dane-mx-limit): {', '.join(skipped_hosts)}"
+        )
+
+    status = max(
+        (info['status'] for info in host_infos),
+        key=lambda s: _STATUS_SEVERITY[s],
+    )
+
+    with_tlsa = sum(1 for info in host_infos if info['has_tlsa'])
+    passing   = sum(1 for info in host_infos if info['status'] == 'ok')
+
+    if passing == total:
+        summary = (
+            f"DANE is correctly configured on all {total} MX hosts for {domain}. "
+            "Certificates are pinned in DNS and match what the servers serve."
+            if total > 1 else
+            "DANE is correctly configured. The mail server certificate is pinned in "
+            "DNS and validates against the live certificate."
+        )
+        return records, status, summary, _dedupe(suggestions)
+
+    # Distinct per-host reasons, worst first, so the summary leads with the
+    # finding most likely to be actionable.
+    reasons = _dedupe([
+        info['reason'] for info in sorted(
+            host_infos, key=lambda i: -_STATUS_SEVERITY[i['status']])
+    ])
+
+    if total == 1:
+        summary = f"{reasons[0][0].upper()}{reasons[0][1:]}."
+    elif with_tlsa == 0:
+        summary = (
+            f"None of the {total} MX hosts for {domain} publish TLSA records: "
+            + "; ".join(reasons[:2]) + "."
+        )
+    elif with_tlsa < total:
+        summary = (
+            f"DANE coverage is incomplete: {with_tlsa} of {total} MX hosts for {domain} "
+            "publish TLSA records. A sender may select any MX, so mail delivered to an "
+            "unpinned host falls back to opportunistic TLS and the protection is only "
+            "as good as the weakest host. Per host: " + "; ".join(reasons[:3]) + "."
+        )
+        suggestions.append(
+            "Publish a TLSA record for every MX host, or remove the hosts that cannot "
+            "have one. Partial coverage gives an attacker a downgrade path via the "
+            "unprotected host."
+        )
+    else:
+        summary = (
+            f"All {total} MX hosts for {domain} publish TLSA records, but not all "
+            "validate: " + "; ".join(reasons[:3]) + "."
+        )
+
+    return records, status, summary, _dedupe(suggestions)
+
+
+# ---------------------------------------------------------------------------
+# Entry point for the DANE check
+# ---------------------------------------------------------------------------
+
+def check_dane(domain, mx_hostname=None, third_party_status='warn',
+               assume_self_hosted=False, mx_limit=5):
+    """
+    Check DANE configuration for every MX host of a domain.
+
+    For each host:
+      1. Locate the zone that would contain its TLSA record and test whether
+         that zone is DNSSEC-signed.
+      2. Look for TLSA records at _25._tcp.<host>.
+      3. If present, retrieve the certificate served on port 25 and test every
+         TLSA record against it; one match authenticates the host (RFC 7672).
+      4. If absent, produce remediation appropriate to who operates the zone —
+         TLSA publication steps for a self-hosted MX, provider-specific steps
+         for a hosted one, since the operator cannot publish in a zone they do
+         not control.
+
+    Args:
+        mx_hostname:        check this host only, instead of the domain's MX set.
+        third_party_status: status used when a hosted provider offers no DANE
+                            and no action is available to the domain owner.
+        assume_self_hosted: treat MX hosts outside the domain as operator-run.
+        mx_limit:           maximum MX hosts to check; 0 means all.
+    """
+    if mx_hostname:
+        hosts = [mx_hostname.rstrip('.').lower()]
+    else:
+        raw_mx   = get_dns_records(domain, 'MX')
+        mx_pairs = _sorted_mx_hosts(domain)
+        if not mx_pairs:
+            if raw_mx:
+                # A null MX (RFC 7505) is a deliberate statement that the domain
+                # accepts no mail, so there is nothing for DANE to protect.
+                return (
+                    [f"Null MX published: {raw_mx[0]}"],
+                    "ok",
+                    "The domain publishes a null MX (RFC 7505) and accepts no inbound "
+                    "mail, so DANE does not apply.",
+                    [],
+                )
             return (
                 ["No MX records found; DANE check skipped"],
                 "missing",
                 "Cannot check DANE without MX records.",
                 [],
             )
+        hosts = _dedupe([host for _, host in mx_pairs])
 
-        # Extract hostname from MX record (format: priority hostname)
-        mx_parts = mx_records[0].split()
-        if len(mx_parts) < 2:
-            return (
-                ["MX record format invalid"],
-                "missing",
-                "MX record format is invalid; cannot extract mail server hostname.",
-                [],
-            )
-        mx_hostname = mx_parts[1].rstrip('.')
+    skipped = []
+    if mx_limit and len(hosts) > mx_limit:
+        skipped = hosts[mx_limit:]
+        hosts   = hosts[:mx_limit]
 
-    # Construct TLSA record name
-    tlsa_name = f"_25._tcp.{mx_hostname}"
-    tlsa_records = get_dns_records(tlsa_name, 'TLSA')
+    host_infos = [
+        _check_mx_host(domain, host, third_party_status, assume_self_hosted)
+        for host in hosts
+    ]
+    return _aggregate_dane(domain, host_infos, skipped)
 
-    if not tlsa_records:
-        return (
-            [f"No TLSA record found at {tlsa_name}"],
-            "missing",
-            "DANE is not configured. SMTP connections cannot be verified against DNS.",
-            [
-                f"Add a TLSA record at {tlsa_name} with format:",
-                f"_25._tcp.{mx_hostname}.  3600  IN  TLSA  3 1 1 <sha256-hash>",
-                "The hash is the SHA-256 of the mail server's public key (TLSA 3 1 1).",
-                f"Generate the hash: echo | openssl s_client -connect {mx_hostname}:25 "
-                "-starttls smtp 2>/dev/null | openssl x509 -pubkey -noout | openssl pkey "
-                "-pubin -outform DER | openssl dgst -sha256 -hex | cut -d' ' -f2",
-                "DANE requires DNSSEC to be enabled on your domain for security.",
-                f"Once published, verify with: dig TLSA {tlsa_name}",
-            ],
-        )
 
-    results.append(f"Mail server: {mx_hostname}")
-    results.extend(tlsa_records)
-
-    # Parse TLSA record (format: usage selector matching-type hash)
-    tlsa_parts = tlsa_records[0].split()
-    if len(tlsa_parts) < 4:
-        return (
-            results + ["TLSA record format invalid"],
-            "missing",
-            "TLSA record format is invalid.",
-            ["Ensure TLSA record follows RFC 6698: usage selector matching-type hash"],
-        )
-
-    usage, selector, matching_type, tlsa_hash = (
-        tlsa_parts[0], tlsa_parts[1], tlsa_parts[2], tlsa_parts[3].lower()
-    )
-
-    # Validate TLSA format
-    usage_map    = {'0': 'PKIX-TA', '1': 'PKIX-EE', '2': 'DANE-TA', '3': 'DANE-EE'}
-    selector_map = {'0': 'Full Cert', '1': 'Public Key'}
-    type_map     = {'1': 'SHA-256', '2': 'SHA-512'}
-
-    if usage not in usage_map:
-        return (
-            results + [f"Invalid TLSA usage field: {usage}"],
-            "warn",
-            f"TLSA record has invalid usage value '{usage}'.",
-            [f"TLSA usage should be 0-3, found {usage}. RFC 6698 recommends usage 3 (DANE-EE)."],
-        )
-
-    if selector not in selector_map:
-        return (
-            results + [f"Invalid TLSA selector field: {selector}"],
-            "warn",
-            f"TLSA record has invalid selector value '{selector}'.",
-            [f"TLSA selector should be 0-1, found {selector}. Usage 1 (public key) is recommended."],
-        )
-
-    if matching_type not in type_map:
-        return (
-            results + [f"Invalid TLSA matching-type field: {matching_type}"],
-            "warn",
-            f"TLSA record has invalid matching-type value '{matching_type}'.",
-            [f"TLSA matching-type should be 1 or 2, found {matching_type}. Type 1 (SHA-256) is standard."],
-        )
-
-    results.append(
-        f"TLSA format: usage={usage_map[usage]}, "
-        f"selector={selector_map[selector]}, type={type_map[matching_type]}"
-    )
-
-    # Fetch certificate from mail server
-    cert_der, cert_error = _fetch_smtp_certificate(mx_hostname, port=25, timeout=10)
-
-    if cert_der is None:
-        return (
-            results + [f"Certificate fetch failed: {cert_error}"],
-            "warn",
-            "Could not connect to the mail server to retrieve its certificate. "
-            "Manual verification may be required.",
-            [
-                f"Verify connectivity to {mx_hostname}:25 — check firewall rules and SMTP service status.",
-                f"Test manually: openssl s_client -connect {mx_hostname}:25 -starttls smtp",
-                "If the connection fails, DANE cannot be fully validated by this script.",
-                "Ensure your mail server is listening on port 25 and has STARTTLS enabled.",
-            ],
-        )
-
-    # Compute expected hash from certificate
-    try:
-        import hashlib
-        from cryptography import x509
-        from cryptography.hazmat.backends import default_backend
-        from cryptography.hazmat.primitives import serialization
-
-        cert_obj = x509.load_der_x509_certificate(cert_der, default_backend())
-
-        if selector == '1':
-            # Public key selector
-            pubkey_der = cert_obj.public_key().public_bytes(
-                encoding=serialization.Encoding.DER,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-        else:
-            # Full certificate selector
-            pubkey_der = cert_der
-
-        if matching_type == '1':
-            computed_hash = hashlib.sha256(pubkey_der).hexdigest()
-        elif matching_type == '2':
-            computed_hash = hashlib.sha512(pubkey_der).hexdigest()
-        else:
-            computed_hash = None
-
-        results.append(f"Certificate public key fetched from {mx_hostname}:25")
-        results.append(f"DNS TLSA hash: {tlsa_hash}")
-        results.append(f"Cert hash:    {computed_hash}")
-
-        if computed_hash and computed_hash.lower() == tlsa_hash.lower():
-            results.append("✓ Certificate hash matches TLSA record")
-            return (
-                results,
-                "ok",
-                "DANE is correctly configured. The mail server certificate is pinned "
-                "in DNS and validates against the live certificate.",
-                [],
-            )
-        else:
-            return (
-                results,
-                "missing",
-                "Certificate hash does not match TLSA record. DANE validation will fail.",
-                [
-                    "The live certificate does not match your TLSA record.",
-                    "If you recently renewed the certificate, update the TLSA record with the new hash.",
-                    f"Generate new hash: echo | openssl s_client -connect {mx_hostname}:25 "
-                    "-starttls smtp 2>/dev/null | openssl x509 -pubkey -noout | openssl pkey "
-                    "-pubin -outform DER | openssl dgst -sha256 -hex | cut -d' ' -f2",
-                    "For smoother certificate rotation, use TLSA usage 2 (DANE-TA) to pin "
-                    "the CA public key instead of the certificate.",
-                ],
-            )
-    except ImportError:
-        return (
-            results + ["cryptography library is not installed"],
-            "warn",
-            "Certificate was retrieved but the 'cryptography' library is not "
-            "available, so hash computation cannot be performed.",
-            [
-                "Install the cryptography library: pip install cryptography",
-                "Or install all optional dependencies: pip install -r requirements.txt",
-            ],
-        )
-    except Exception as e:
-        return (
-            results + [f"Hash computation error: {str(e)[:80]}"],
-            "warn",
-            "Certificate was retrieved but hash computation failed.",
-            [
-                "Manual verification: extract the cert, compute SHA-256 of public key, "
-                "and compare against the TLSA record.",
-            ],
-        )
+def format_provider_table():
+    """Render the known-provider table for --list-providers."""
+    posture = {
+        'customer':  'yes, customer enables it',
+        'migration': 'yes, on a different endpoint',
+        'provider':  'yes, published by the provider',
+        'no':        'no',
+        'unknown':   'not established — determined at runtime',
+    }
+    width = max(len(p['name']) for p in _MAIL_PROVIDERS)
+    lines = [
+        "Mail providers recognised by the DANE check.",
+        "",
+        "Inbound DANE posture is only asserted where it has been verified. Entries",
+        "marked 'not established' are listed so the report can name the provider;",
+        "for those, whether DANE is possible is determined at runtime by testing",
+        "whether the zone holding the MX hostname is DNSSEC-signed.",
+        "",
+        f"{'PROVIDER'.ljust(width)}  INBOUND DANE",
+        f"{'-' * width}  {'-' * 32}",
+    ]
+    for provider in _MAIL_PROVIDERS:
+        lines.append(f"{provider['name'].ljust(width)}  {posture[provider['inbound_dane']]}")
+        lines.append(f"{' ' * width}  MX: {', '.join(provider['suffixes'])}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2276,8 +3261,44 @@ def main():
             "Example: https://hc-ping.com/your-uuid"
         ),
     )
+    parser.add_argument(
+        "--dane-strict", action="store_true",
+        help=(
+            "Report a missing TLSA record as FAIL even when the MX is operated by a "
+            "third party that does not offer inbound DANE. The default is WARNING, "
+            "since in that case there is no action available to the domain owner."
+        ),
+    )
+    parser.add_argument(
+        "--dane-self-hosted", action="store_true",
+        help=(
+            "Treat the MX hostname as a zone you operate even though it sits outside "
+            "the checked domain (e.g. example.com with MX mail.example.net). Forces "
+            "TLSA publication guidance instead of hosted-provider guidance."
+        ),
+    )
+    parser.add_argument(
+        "--dane-mx-limit", type=int, default=5, metavar="N",
+        help=(
+            "Maximum number of MX hosts to check for DANE, in preference order. "
+            "Each host with a TLSA record costs one SMTP connection. "
+            "Use 0 to check every host. Default: 5"
+        ),
+    )
+    parser.add_argument(
+        "--list-providers", action="store_true",
+        help=(
+            "Print the mail providers recognised by the DANE check, with their known "
+            "inbound DANE posture, and exit."
+        ),
+    )
 
     args       = parser.parse_args()
+
+    if args.list_providers:
+        print(format_provider_table())
+        sys.exit(0)
+
     raw_domain = args.domain or input("Enter domain to check: ").strip()
     try:
         domain = validate_domain(raw_domain)
@@ -2296,7 +3317,12 @@ def main():
         ("DMARC Record",   "dmarc",   lambda d: check_dmarc(d)),
         ("MTA-STS Record", "mta_sts", lambda d: check_mta_sts(d)),
         ("DNSSEC",         "dnssec",  lambda d: check_dnssec(d)),
-        ("DANE Record",    "dane",    lambda d: check_dane(d)),
+        ("DANE Record",    "dane",    lambda d: check_dane(
+            d,
+            third_party_status='missing' if args.dane_strict else 'warn',
+            assume_self_hosted=args.dane_self_hosted,
+            mx_limit=max(0, args.dane_mx_limit),
+        )),
         ("CAA Record",     "caa",     lambda d: check_caa(d, permitted_cas=args.permitted_cas)),
         ("BIMI Record",    "bimi",    lambda d: check_bimi(d)),
     ]
