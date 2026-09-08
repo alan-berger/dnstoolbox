@@ -1,3 +1,8 @@
-dnspython>=2.4.0
-requests>=2.28.0
-cryptography>=41.0.0
+# check_dns.py dependencies
+#
+# SMTP/STARTTLS handling uses smtplib from the standard library, so the DANE
+# work added no new third-party dependencies.
+
+dnspython>=2.4.0        # DNS resolution, DNSSEC and TLSA record types
+requests>=2.28.0        # MTA-STS policy files, BIMI logos and VMCs, ntfy, healthchecks
+cryptography>=41.0.0    # DANE certificate parsing and TLSA hash computation
